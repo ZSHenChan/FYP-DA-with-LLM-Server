@@ -1,9 +1,30 @@
 import os
+from pathlib import Path
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from pydantic_settings import BaseSettings
+ROOT = Path(__file__).resolve().parents[1]
 
+class AppConfig(BaseSettings):
+    TEMP_FILEPATH: str = 'tmp'
+    DATA_FILEPATH: str = 'data'
+    SESSION_FILEPATH: str = 'session'
+    FIGURE_FILEPATH: str = 'figures'
+    MODEL_FILEPATH: str = 'model'
 
-class Config(BaseSettings):
+    UUID_LEN: int = 8
+    TASK_NODE_MAX_RETRIES: int = 3
+    TASK_GRAPH_MAX_RETRIES: int = 3
+
+class LlmConfig(BaseSettings):
+    LLM_MAX_RETRIES: int = 2
+    OPENAI_MODEL: str = 'gpt-5-mini-2025-08-07'
+    TIMEOUT: int | None = None
+    CACHE: bool = False
+    TEMPERATURE: int = 0
+    MAX_COMPLETION_TOKENS: int | None = None
+    OPENAI_API_KEY: str | None = None
+
+class Config(LlmConfig, AppConfig, BaseSettings):
     ENV: str = "development"
     DEBUG: bool = True
     APP_HOST: str = "0.0.0.0"
@@ -17,6 +38,11 @@ class Config(BaseSettings):
     CELERY_BACKEND_URL: str = "redis://:password123@localhost:6379/0"
     REDIS_HOST: str = "localhost"
     REDIS_PORT: int = 6379
+
+    model_config = SettingsConfigDict(
+        env_file=str(ROOT / ".env"),
+        env_file_encoding="utf-8",
+    )
 
 
 class TestConfig(Config):
