@@ -1,6 +1,7 @@
 # FastAPI Boilerplate
 
 # Features
+
 - Async SQLAlchemy session
 - Custom user class
 - Dependencies for specific permissions
@@ -12,40 +13,46 @@
 ## Run
 
 ### Launch docker
+
 ```shell
-> docker-compose -f docker/docker-compose.yml up
+docker-compose -f docker/docker-compose.yml up
 ```
 
 ### Install dependency
+
 ```shell
-> poetry shell
-> poetry install
+poetry shell
+poetry install
 ```
 
 ### Apply alembic revision
+
 ```shell
-> alembic upgrade head
+alembic upgrade head
 ```
 
 ### Run server
+
 ```shell
-> python3 main.py --env local|dev|prod --debug
+poetry run python3 main.py --env local|dev|prod --debug
 ```
 
 ### Run test codes
+
 ```shell
-> make test
+make test
 ```
 
 ### Make coverage report
+
 ```shell
-> make cov
+make cov
 ```
 
 ### Formatting
 
 ```shell
-> pre-commit
+pre-commit
 ```
 
 ## SQLAlchemy for asyncio context
@@ -62,6 +69,7 @@ async def create_user(self):
 Do not use explicit `commit()`. `Transactional` class automatically do.
 
 ### Query with asyncio.gather()
+
 When executing queries concurrently through `asyncio.gather()`, you must use the `session_factory` context manager rather than the globally used session.
 
 ```python
@@ -80,12 +88,12 @@ async def main() -> None:
         get_by_id(user_id=2),
     )
 ```
+
 If you do not use a database connection like `session.add()`, it is recommended to use a globally provided session.
 
 ### Multiple databases
 
 Go to `core/config.py` and edit `WRITER_DB_URL` and `READER_DB_URL` in the config class.
-
 
 If you need additional logic to use the database, refer to the `get_bind()` method of `RoutingClass`.
 
@@ -161,6 +169,7 @@ async def get_user_list(
 ):
     pass
 ```
+
 Insert permission through `dependencies` argument.
 
 If you want to make your own permission, inherit `BasePermission` and implement `has_permission()` function.
@@ -174,6 +183,7 @@ Refer the README of https://github.com/teamhide/fastapi-event
 ## Cache
 
 ### Caching by prefix
+
 ```python
 from core.helpers.cache import Cache
 
@@ -184,6 +194,7 @@ async def get_user():
 ```
 
 ### Caching by tag
+
 ```python
 from core.helpers.cache import Cache, CacheTag
 
