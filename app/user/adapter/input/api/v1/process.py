@@ -35,6 +35,7 @@ async def run_agent_work(
     human_input: str, 
     file_names: List[str],
     session_id: str, 
+    run_id: str, 
     q: Queue
 ):
     loop = asyncio.get_running_loop()
@@ -61,10 +62,11 @@ async def run_agent_work(
             
     try:
         result = await asyncio.to_thread(
-            master_agent.process_demo,
+            master_agent.process_requirement,
             human_input,
             file_names,
             session_id,
+            run_id,
             progress_callback
         )
         
@@ -91,6 +93,7 @@ async def start_processing(
 ):
     from pathlib import Path
     session_id = generate_id(prefix='sess')
+    run_id = generate_id(prefix='run')
     
     q = Queue()
     if session_id in SESSION_QUEUES:
@@ -98,7 +101,7 @@ async def start_processing(
     
     SESSION_QUEUES[session_id] = q
 
-    dest_dir = Path(os.path.join(config.TEMP_FILEPATH, session_id, config.DATA_FILEPATH))
+    dest_dir = Path(os.path.join(config.SESSION_FILEPATH, session_id, config.DATA_FILEPATH))
     dest_dir.mkdir(parents=True, exist_ok=True)
     file_names: List[str] = []
 
@@ -125,6 +128,7 @@ async def start_processing(
             prompt,
             file_names,
             session_id,
+            run_id,
             q
         )
     )
