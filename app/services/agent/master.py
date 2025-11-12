@@ -1,4 +1,4 @@
-import os
+import os, logging
 from typing import List, Union
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
@@ -9,7 +9,10 @@ from .utils import load_prompt, write_response_txt
 from .graph import TaskGraph
 from .sub_agents import AnalysisAgent
 
+
 OPENAI_API_KEY = config.OPENAI_API_KEY
+
+c_logger = logging.getLogger(config.CENTRAL_LOG_NAME)
 
 class MasterAgent:
     def __init__(self, model:str, tools=[], max_retries:int = 3):
@@ -48,7 +51,7 @@ class MasterAgent:
             return []
         
         # Common image extensions
-        image_extensions = ['*.png', '*.jpg', '*.jpeg', '*.svg', '*.pdf']
+        image_extensions = config.VISUAL_ALLOWED_EXTENSIONS
         
         image_paths = []
         for ext in image_extensions:
@@ -58,25 +61,7 @@ class MasterAgent:
         # Sort for consistent ordering
         return sorted(image_paths)
 
-    def generate_id(self, prefix: str | None = None, uuid_len: int = config.UUID_LEN) -> str:
-        import uuid
-        """
-        Generate a shorter run ID using first 8 characters of UUID.
-        
-        Args:
-            prefix: Prefix for the run ID (default: "run")
-            
-        Returns:
-            Generated run ID string
-            
-        Example:
-            - generate_run_id_short() -> "run_a1b2c3d4"
-        """
-        if not prefix:
-            return uuid.uuid4().hex[:uuid_len]
-        return f"{prefix}_{uuid.uuid4().hex[:uuid_len]}"
-
-    def _write_agent_state_to_json(self, agent_state: GlobalAgentState, ensure_dir: bool = True, indent: int = 1) -> None:
+    def _write_agent_state_to_json(self, sess_id: str, run_id: str, agent_state, ensure_dir: bool = True, indent: int = 1) -> None:
         """
         Write agent_state (GraphState or plain dict) to a JSON file.
         Non-serializable values are converted via str().
@@ -84,8 +69,8 @@ class MasterAgent:
         from pathlib import Path
 
         import json, os
-        run_dir = Path(os.path.join(config.DATA_FILEPATH,agent_state['sess_id'],agent_state['run_id']))
-
+        run_dir = Path(os.path.join(config.SESSION_FILEPATH, sess_id, run_id))
+        sess_log = logging.getLogger(config.SESS_LOG_NAME)
         if ensure_dir:
             dirpath = os.path.dirname(run_dir) or "."
             os.makedirs(dirpath, exist_ok=True)
@@ -95,9 +80,9 @@ class MasterAgent:
         try:
             with open(filepath, "w", encoding="utf-8") as f:
                 json.dump(agent_state, f, ensure_ascii=False, indent=indent, default=str)
-            print(f"Agent State stored in {filepath}")
+            sess_log.info(f"Agent State stored in {filepath}")
         except Exception as e:
-            print(f"Failed to save agent state: {e}")
+            sess_log.error(f"Failed to save agent state: {e}")
 
     def _refine_task_graph_on_additional_request(self):
         # TODO
@@ -128,6 +113,55 @@ class MasterAgent:
         response = self.llm.invoke(messages)
         return response.text
     
+    def _migrate_run_outputs(self, sess_id: str, run_id: str, create_dest: bool = True):
+        """
+        Moves all run-specific outputs (figures, code, state) 
+        from temp to permanent storage.
+        """
+        import shutil
+        from pathlib import Path
+        results = {'success': 0, 'failed': 0, 'errors': []}
+
+        # 1. Define paths
+        source_run_dir = Path(os.path.join(config.TEMP_FILEPATH, sess_id, run_id))
+        dest_run_dir = Path(os.path.join(config.SESSION_FILEPATH, sess_id, run_id))
+        sess_logger = logging.getLogger(config.SESS_LOG_NAME)
+
+        # 2. Check source
+        if not source_run_dir.exists():
+            sess_logger.warning(f"No temp run directory found at {source_run_dir}, skipping run migration.")
+            return results
+
+        if not source_run_dir.is_dir():
+            raise NotADirectoryError(f"Source path is not a directory: {source_run_dir}")
+
+        # 3. Create destination
+        if create_dest:
+            dest_run_dir.mkdir(parents=True, exist_ok=True)
+        elif not dest_run_dir.exists():
+            raise FileNotFoundError(f"Destination directory does not exist: {dest_run_dir}")
+
+        # 4. Move all contents of the run directory
+        #    We move the directory itself for simplicity.
+        try:
+            # We can't move a dir to a pre-existing dir, so we move its contents
+            for item_name in os.listdir(source_run_dir):
+                source_path = source_run_dir / item_name
+                target_path = dest_run_dir / item_name
+                shutil.move(str(source_path), str(target_path))
+                results['success'] += 1
+            
+            # Clean up the now-empty source run dir
+            source_run_dir.rmdir()
+            
+        except Exception as e:
+            results['failed'] = 1 # We tried to move the whole dir
+            results['errors'].append(f"{source_run_dir.name}: {str(e)}")
+        
+        sess_logger.info(f"\nSummary: {results['success']} run items moved, {results['failed']} failed")
+        return results
+
+    # Not in use
     def _migrate_all_current_run_data(self, sess_id:str, run_id:str, create_dest: bool = True):
         """
         Move all current run files {config.SESSION_FILEPATH}/{sess_id}/{run_id}.
@@ -146,7 +180,7 @@ class MasterAgent:
     
         # Convert to Path objects
         source_dir = Path(os.path.join(config.TEMP_FILEPATH, sess_id))
-        dest_dir = Path(os.path.join(config.SESSION_FILEPATH, sess_id, run_id))
+        dest_dir = Path(os.path.join(config.SESSION_FILEPATH, sess_id))
         
         # Check if source exists
         if not source_dir.exists():
@@ -175,49 +209,113 @@ class MasterAgent:
         print(f"\nSummary: {results['success']} files moved, {results['failed']} failed")
         return results
 
-    def process_requirement(self, human_input:str, file_list: List[str], sess_id: str, progress_callback: Union[callable, None]) -> str:
-        run_id = self.generate_id(prefix='run')
-        print(f"== Run ID: {run_id} ==\n")
+    def process_requirement(self, human_input:str, file_list: List[str], sess_id: str, run_id: str, progress_callback: Union[callable, None]) -> str:
+        import time
+
+        start_time = time.time()
+        log_summary_extra = {
+            'sess_id': sess_id,
+            'run_id': run_id,
+            'user_request': human_input,
+            'model':{'name':config.OPENAI_MODEL,'timeout':config.TIMEOUT,'cache':config.CACHE,'temperature':config.TEMPERATURE,'max_tokens':config.MAX_COMPLETION_TOKENS}
+        }
+        c_logger.info(
+            f"Start processing request: {human_input}",
+            extra={'sess_id': sess_id, 'run_id': run_id, 'files': file_list}
+        )
+
+        status = 'failure'
+
+        # Configure Session logger
+        sess_log_dir = os.path.join(config.SESSION_FILEPATH, sess_id, run_id)
+        os.makedirs(sess_log_dir, exist_ok=True)
+        sess_log_file_path = os.path.join(sess_log_dir, config.SESS_LOG_FILENAME)
+
+        sess_file_handler = logging.FileHandler(sess_log_file_path)
+        sess_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        sess_file_handler.setFormatter(sess_formatter)
+        sess_file_handler.setLevel(logging.DEBUG)
+        
+        sess_logger = logging.getLogger(config.SESS_LOG_NAME)
+        sess_logger.setLevel(logging.DEBUG)
+        sess_logger.addHandler(sess_file_handler)
 
         # Summarize user request
         # user_request = self._summarize_user_request(human_req=human_input)
         user_request = human_input
 
-        state: GlobalAgentState = self._initialize_agent_state(sess_id=sess_id, run_id=run_id, requirement=user_request, data_path=f'tmp/{sess_id}/data/data.csv')
+        state: GlobalAgentState = self._initialize_agent_state(sess_id=sess_id, run_id=run_id, requirement=user_request, file_list=file_list)
+        agent_state_version = {'initial':state}
 
-        if len(self.task_graph.nodes) == 0:
-            print('Initiating TaskGraph')
+        try:
+            if len(self.task_graph.nodes) == 0:
+                sess_logger.info('Initiating TaskGraph')
+                if progress_callback:
+                    progress_callback(f'Initiating TaskGraph')
+                self.task_graph.initialize_task_graph(global_agent_state=state, human_input=user_request, file_list=file_list, progress_callback=progress_callback)
+            else:
+                sess_logger.info('Updating TaskGraph')
+                if progress_callback:
+                    progress_callback(f'Starting to refine TaskGraph')
+                self._refine_task_graph_on_additional_request()
+
+
+            workflow_state = self.task_graph.run_workflow(agent_state=state, progress_callback=progress_callback)
+            self.task_graph.print_graph(sess_id=state['sess_id'], run_id=state['run_id'], verbose=True)
+            agent_state_version['after workflow'] = workflow_state
+            
+            # Collect all diagrams under figures/
+            visualisation_paths = self._collect_visualization_paths(sess_id=state['sess_id'], run_id=state['run_id'])
+            workflow_state['visualization_paths'] = visualisation_paths
+            
             if progress_callback:
-                progress_callback(f'Initiating TaskGraph')
-            self.task_graph.initialize_and_populate_task_graph(global_agent_state=state, human_input=user_request, file_list=file_list, progress_callback=progress_callback)
-        else:
-            print('Starting to refine TaskGraph')
+                progress_callback(f'Analysis in Progress')
+            final_state = self.analysis_agent.analyze_all_diagrams(state=workflow_state, prompt=f'Give insights on these diagrams regarding user request:{workflow_state["requirement"]}')
+            agent_state_version['final'] = final_state
+
             if progress_callback:
-                progress_callback(f'Starting to refine TaskGraph')
-            self._refine_task_graph_on_additional_request()
+                progress_callback(f'Fabricating Final Answer')
 
+            # Synthesis final response
+            response_str = self._provide_answer(state=final_state)
+            write_response_txt(response=str(response_str), sess_id=state['sess_id'], run_id=state['run_id'])
 
-        self.task_graph.print_graph(sess_id=state['sess_id'], run_id=state['run_id'], verbose=True)
-        workflow_state = self.task_graph.run_workflow(agent_state=state)
+            # self._migrate_run_outputs(sess_id=state['sess_id'], run_id=state['run_id'])
 
-        self._migrate_all_current_run_data(sess_id=state['sess_id'], run_id=state['run_id'])
-        # Collect all diagrams under data/figures
-        visualisation_paths = self._collect_visualization_paths(sess_id=state['sess_id'], run_id=state['run_id'])
-        workflow_state['visualization_paths'] = visualisation_paths
+            # try:
+            #     main_temp_dir = Path(os.path.join(config.TEMP_FILEPATH, sess_id))
+            #     main_temp_dir.rmdir()
+            # except OSError as e:
+            #     # We expect this to fail if not empty, which is fine
+            #     sess_logger.error(f"Could not fully clean up temp dir {main_temp_dir}: {e}")
+
+            status = "success"
+            sess_logger.info("Run completed successfully.")
+            return response_str
         
-        print("== Analysis in Progress")
-        if progress_callback:
-            progress_callback(f'Analysis in Progress')
-        final_state = self.analysis_agent.analyze_all_diagrams(state=workflow_state, prompt=f'Give insights on these diagrams regarding user request:{workflow_state["requirement"]}')
-        self._write_agent_state_to_json(agent_state=final_state)
+        except Exception as e:
+            sess_logger.error(f"FATAL ERROR in run {run_id}: {e}", exc_info=True)
+            c_logger.error(
+                f"Finished request",
+                extra={'traceback',e}
+            ) 
+            return 'Something went wrong'
 
-        print("== Fabricating Final Answer")
-        if progress_callback:
-            progress_callback(f'Fabricating Final Answer')
-        response_str = self._provide_answer(state=final_state)
-        write_response_txt(response=str(response_str), sess_id=state['sess_id'], run_id=state['run_id'])
+        finally:
+            # Post action log
+            duration_sec = time.time() - start_time
+            log_summary_extra['status'] = status
+            log_summary_extra['duration_sec'] = round(duration_sec, 2)
+            c_logger.info(
+                f"Finished request",
+                extra=log_summary_extra
+            )
+            self._write_agent_state_to_json(sess_id=sess_id, run_id=run_id, agent_state=agent_state_version)
 
-        return response_str
+            # Clean up session logger
+            sess_logger.info(f"Closing log handler for run_id {run_id}")
+            sess_logger.removeHandler(sess_file_handler)
+            sess_file_handler.close()
     
     def process_demo(self, human_input:str, file_list: List[str], sess_id: str, progress_callback: Union[callable, None] = None) -> str:
         from time import sleep
@@ -234,7 +332,6 @@ class MasterAgent:
 - The relationship is weak and unstable: scatter points are widely spread with clusters and outliers, residuals from a simple linear fit show curvature and changing spread, and residuals have heavy tails.  
 - Time structure matters: price trends upward while volume tends downward with spikes. The price–volume link appears to change over time (nonstationarity / regime changes).
 '''
-        # return read_text_file("test-response.txt")
     
 
 def get_master_agent():

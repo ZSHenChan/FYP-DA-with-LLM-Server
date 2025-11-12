@@ -1,5 +1,4 @@
-import base64
-import copy
+import base64, logging, copy
 from typing import List
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -9,6 +8,8 @@ from .schemas import PydanticAnalysisResult, GlobalAgentState, AgentMessage
 from .utils import load_prompt
 
 OPENAI_API_KEY = config.OPENAI_API_KEY
+
+logger = logging.getLogger(config.SESS_LOG_NAME)
 
 class AnalysisAgent:
     """A class to perform analysis based on code outputs."""
@@ -55,7 +56,7 @@ class AnalysisAgent:
     def analyze_all_diagrams(self, prompt:str, state: GlobalAgentState) -> GlobalAgentState:
         
         diagram_list: List[str] = state['visualization_paths']
-        print(f'== Analyzing {len(diagram_list)} diagrams...')
+        logger.info(f'== Analyzing {len(diagram_list)} diagrams...')
 
         state_copy = copy.deepcopy(state)
 
