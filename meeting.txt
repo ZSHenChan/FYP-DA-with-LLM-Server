@@ -1,0 +1,31 @@
+Ap -> Process (ET + Visual) -> AA
+[ ] Process need ETA
+
+Report covers:
+- easy, med, hard task
+-- Time/Space complexity
+-- Complexity of graph
+-- How many agents created?
+-- Quality of result
+-- Does it come out with same conclusion?
+- Describe the behavior of system (does it act in different way in certain condition?)
+
+TODO:
+- Planner to improve existing plan, instead of generating new ideas
+[] How does the planner learn when the process went into error
+
+- Using differnet llm models (ChatGPT, Gemini etc)
+[] Use Gemini
+[] Use others
+
+- Context window management (Context Window)
+[] Planner Context
+[-] TaskNode Context
+
+- Handling multiple different datafiles, url
+[] Handle images
+[] Handle url
+[] Handle Misc.
+
+- AA diagrams selection
+[] Decide which diagrams to present to user, accompanied with explanation
