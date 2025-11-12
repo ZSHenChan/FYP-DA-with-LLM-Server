@@ -1,26 +1,39 @@
 import os
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List
+
+import matplotlib
+matplotlib.use('Agg')
 
 ROOT = Path(__file__).resolve().parents[1]
 
 class AppConfig(BaseSettings):
+    # File Paths
     TEMP_FILEPATH: str = 'tmp'
     DATA_FILEPATH: str = 'data'
     SESSION_FILEPATH: str = 'session'
     FIGURE_FILEPATH: str = 'figures'
     MODEL_FILEPATH: str = 'model'
 
+    SESS_LOG_NAME: str = 'sess_log'
+    SESS_LOG_FILENAME: str = 'sess.log'
+    CENTRAL_LOG_DIR: str = 'logs'
+    CENTRAL_LOG_FILENAME: str = 'central.log'
+    CENTRAL_LOG_NAME: str = 'api_gateway'
+
     UUID_LEN: int = 8
     TASK_NODE_MAX_RETRIES: int = 3
     TASK_GRAPH_MAX_RETRIES: int = 3
+
+    VISUAL_ALLOWED_EXTENSIONS: List[str] = ['*.png', '*.jpg', '*.jpeg', '*.svg', '*.pdf']
 
 class LlmConfig(BaseSettings):
     LLM_MAX_RETRIES: int = 2
     OPENAI_MODEL: str = 'gpt-5-mini-2025-08-07'
     TIMEOUT: int | None = None
     CACHE: bool = False
-    TEMPERATURE: int = 0
+    TEMPERATURE: float = 0.3
     MAX_COMPLETION_TOKENS: int | None = None
     OPENAI_API_KEY: str | None = None
 
