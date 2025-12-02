@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException,  UploadFile, File, Form, Depends, 
 from dependency_injector.wiring import Provide, inject
 from app.services.agent import get_master_agent
 from typing import Dict, Union, Optional, List
+from app.services.agent.utils import SessionWorkspace
 
 process_router = APIRouter()
 
@@ -34,8 +35,7 @@ async def run_agent_work(
     master_agent, 
     human_input: str, 
     file_names: List[str],
-    session_id: str, 
-    run_id: str, 
+    workspace: SessionWorkspace,
     q: Queue
 ):
     loop = asyncio.get_running_loop()
@@ -62,11 +62,10 @@ async def run_agent_work(
             
     try:
         result = await asyncio.to_thread(
-            master_agent.process_requirement,
+            master_agent.run_request,
             human_input,
             file_names,
-            session_id,
-            run_id,
+            workspace,
             progress_callback
         )
         
@@ -101,8 +100,8 @@ async def start_processing(
     
     SESSION_QUEUES[session_id] = q
 
-    dest_dir = Path(os.path.join(config.SESSION_FILEPATH, session_id, config.DATA_FILEPATH))
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    workspace = SessionWorkspace(session_id, run_id)
+    dest_dir = workspace.data_dir
     file_names: List[str] = []
 
     if files and len(files) > 0:
@@ -127,8 +126,7 @@ async def start_processing(
             master_agent,
             prompt,
             file_names,
-            session_id,
-            run_id,
+            workspace,
             q
         )
     )

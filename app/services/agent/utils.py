@@ -6,6 +6,66 @@ from .schemas import GlobalAgentState
 
 logger = logging.getLogger(config.SESS_LOG_NAME)
 
+from pathlib import Path
+from core.config import config
+
+class SessionWorkspace:
+    """
+    Encapsulates all file system operations for a specific run.
+    No other class should import 'config' for path manipulation.
+    """
+    def __init__(self, sess_id: str, run_id: str):
+        self.sess_id = sess_id
+        self.run_id = run_id
+
+        # stored at session/{sess_id}
+        self.session_base = Path(config.SESSION_FILEPATH) / sess_id
+        self.data_dir = self.session_base / config.DATA_FILEPATH
+        
+        # stored at session/{sess_id}/{run_id}
+        self.run_base = self.session_base / run_id
+        self.figure_dir = self.run_base / config.FIGURE_FILEPATH
+        self.model_dir = self.run_base / config.MODEL_FILEPATH
+        
+        # Ensure directories exist
+        for d in [self.session_base, self.data_dir, self.figure_dir, self.model_dir]:
+            d.mkdir(parents=True, exist_ok=True)
+
+    def get_log_path(self) -> Path:
+        return self.run_base / config.SESS_LOG_FILENAME
+
+    def save_json(self, filename: str, data: dict):
+        sess_log = logging.getLogger(config.SESS_LOG_NAME)
+
+        filepath = os.path.join(self.run_base, filename)
+
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=True, default=str)
+            sess_log.info(f"Agent State stored in {filepath}")
+        except Exception as e:
+            sess_log.error(f"Failed to save agent state: {e}")
+
+    def list_figures(self) -> list[str]:
+        """
+        Returns a sorted list of absolute string paths for all images 
+        generated in the current run's figure directory.
+        """
+        image_paths = []
+        # We look for extensions defined in your config (e.g., .png, .jpg)
+        for ext in config.VISUAL_ALLOWED_EXTENSIONS:
+            # Using pathlib's glob is cleaner than os.glob
+            # pattern e.g., "*.png"
+            pattern = f"*{ext}" if ext.startswith(".") else f"*.{ext}"
+            found = list(self.figure_dir.glob(pattern))
+            image_paths.extend(found)
+        
+        # Sort them so the analysis order is deterministic
+        image_paths.sort(key=lambda p: p.name)
+        
+        # Convert Path objects to strings for the State dict
+        return [str(p) for p in image_paths]
+    
 def load_prompt(agent_name, key: str='system_prompt') -> str:
     file_path = f'prompts.json'
     try:

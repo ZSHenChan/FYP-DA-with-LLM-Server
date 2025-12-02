@@ -1,7 +1,7 @@
 import os, logging, json
 from copy import deepcopy
 from graphlib import TopologicalSorter, CycleError
-from typing import List, Dict, Union
+from typing import Any, List, Dict, Union
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
@@ -11,7 +11,7 @@ from .schemas import (
     GlobalAgentState, PydanticActionGraph, TaskStatus, 
     TaskType, PydanticTaskGraph
 )
-from .utils import CodeExecutor, ExecuteResult, load_prompt, increase_num_steps, comment_block
+from .utils import CodeExecutor, ExecuteResult, load_prompt, increase_num_steps, comment_block, SessionWorkspace
 
 OPENAI_API_KEY = config.OPENAI_API_KEY
 
@@ -95,11 +95,8 @@ class TaskNode:
         return (f"TaskNode(id='{self.node_id}', status='{self.status.value}', "
                 f"instruction='{self.instruction[:30]}...', deps={self.dependencies})")
 
-    def generate_action_graph(self, global_agent_state: GlobalAgentState, namespace: dict, tool_sets=[], additional_instruction: str = "", conversation_history: list = []) -> ActionGraph:
+    def plan_actions(self, global_agent_state: GlobalAgentState, workspace: SessionWorkspace, namespace: dict, tool_sets=[], additional_instruction: str = "", conversation_history: list = []) -> ActionGraph:
         structured_llm = self.llm.with_structured_output(PydanticActionGraph)
-        data_dir = os.path.join(config.SESSION_FILEPATH, global_agent_state['sess_id'], config.DATA_FILEPATH)
-        figure_dir = os.path.join(config.SESSION_FILEPATH, global_agent_state['sess_id'], global_agent_state['run_id'], config.FIGURE_FILEPATH)
-        model_dir = os.path.join(config.SESSION_FILEPATH, global_agent_state['sess_id'], global_agent_state['run_id'], config.MODEL_FILEPATH)
         
         sys_prompt_template = load_prompt(agent_name='code')
         prompt = ChatPromptTemplate.from_messages([
@@ -110,7 +107,7 @@ class TaskNode:
         ])
         chain = prompt | structured_llm
         
-        pydantic_action_graph: PydanticActionGraph = chain.invoke({"instruction": self.instruction, "additional_instruction":additional_instruction, "agent_state":global_agent_state, "namespace":namespace, "data_dir":data_dir, "figure_dir":figure_dir, "model_dir":model_dir, "chat_history": conversation_history}) # type: ignore
+        pydantic_action_graph: PydanticActionGraph = chain.invoke({"instruction": self.instruction, "additional_instruction":additional_instruction, "agent_state":global_agent_state, "namespace":namespace, "data_dir":str(workspace.data_dir), "figure_dir":str(workspace.figure_dir), "model_dir":str(workspace.model_dir), "chat_history": conversation_history}) # type: ignore
         
         action_graph = ActionGraph()
         for p_node in pydantic_action_graph.task_nodes:
@@ -124,17 +121,17 @@ class TaskNode:
         increase_num_steps(global_agent_state)
         return action_graph
 
-    def refine_and_update_action_graph(self, global_agent_state: GlobalAgentState, namespace: dict, conversation_history: list = []):
+    def replan_actions(self, global_agent_state: GlobalAgentState, workspace: SessionWorkspace, namespace: dict, conversation_history: list = []):
         refinement_instruction = (
           "The previous plan failed. Review the chat history, paying close attention "
           "to the last 'Human' message (which contains the error) and the 'AI' message "
           "(the plan that failed). Generate a new, corrected plan to achieve the goal."
         )
-        refined_graph: ActionGraph = self.generate_action_graph(global_agent_state=global_agent_state, namespace=namespace, additional_instruction=refinement_instruction, conversation_history=conversation_history)
+        refined_graph: ActionGraph = self.plan_actions(global_agent_state=global_agent_state, workspace=workspace, namespace=namespace, additional_instruction=refinement_instruction, conversation_history=conversation_history)
         self.action_graph.nodes = refined_graph.nodes
         self.action_graph.result = None
 
-    def iterative_refining(self, global_agent_state: GlobalAgentState, max_retries: int = config.TASK_NODE_MAX_RETRIES):
+    def execute_with_retry(self, global_agent_state: GlobalAgentState, workspace: SessionWorkspace, max_retries: int = config.TASK_NODE_MAX_RETRIES):
           """Generate and refine the ActionGraph within a trial limit."""
           debug_agent_state: GlobalAgentState = deepcopy(global_agent_state)
           
@@ -142,7 +139,7 @@ class TaskNode:
 
           self.conversation_history = []
 
-          action_graph: ActionGraph = self.generate_action_graph(global_agent_state=debug_agent_state, namespace=namespace)
+          action_graph: ActionGraph = self.plan_actions(global_agent_state=debug_agent_state, workspace=workspace, namespace=namespace)
           self.action_graph = action_graph
 
           for i in range(max_retries):
@@ -172,7 +169,7 @@ class TaskNode:
               logger.debug(self.action_graph.result)
               if self.action_graph.result.success is False:
                   
-                  self.refine_and_update_action_graph(global_agent_state=debug_agent_state, namespace=namespace, conversation_history=self.conversation_history)
+                  self.replan_actions(global_agent_state=debug_agent_state, workspace=workspace, namespace=namespace, conversation_history=self.conversation_history)
                   increase_num_steps(global_agent_state)
               else:
                   self.status = TaskStatus.SUCCESS
@@ -293,88 +290,88 @@ class TaskGraph:
 
         return buffer.getvalue()
     
-    def _collect_file_list_data(self, file_list: List[str], sess_id: str) -> List[Dict[str, Union[str, Dict[str, str]]]]:
-        import mimetypes
-        from pathlib import Path
-        message_parts: List[Dict[str, Union[str, Dict[str, str]]]] = []
+    # Not in use
+#     def _collect_file_list_data(self, file_list: List[str], sess_id: str) -> List[Dict[str, Union[str, Dict[str, str]]]]:
+#         import mimetypes
+#         from pathlib import Path
+#         message_parts: List[Dict[str, Union[str, Dict[str, str]]]] = []
 
-        for filename in file_list:
-            file_path = Path(os.path.join(config.SESSION_FILEPATH, sess_id, config.DATA_FILEPATH, filename))
-            try:
-                mime_type, _ = mimetypes.guess_type(file_path)
+#         for filename in file_list:
+#             file_path = Path(os.path.join(config.SESSION_FILEPATH, sess_id, config.DATA_FILEPATH, filename))
+#             try:
+#                 mime_type, _ = mimetypes.guess_type(file_path)
                 
-                if mime_type:
-                    file_type = mime_type.split('/')[0]
+#                 if mime_type:
+#                     file_type = mime_type.split('/')[0]
                     
-                    if file_type == 'image':
-                        encoded_image = self.encode_image(file_path)
-                        message_parts.append({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime_type};base64,{encoded_image}"
-                            }
-                        })
-                    elif file_type == 'csv' in mime_type:
-                        try:
-                            dataset_info = self._synthesis_dataset_info(filepath=file_path)
-                            message_parts.append({
-                                "type": "text",
-                                "text": f"The dataset info: {dataset_info}"
-                            })
-                        except Exception as e:
-                            content = self._read_text_file(file_path)
-                            message_parts.append({
-                                "type": "text",
-                                "text": f"The dataset: {content[:1000]}"
-                            })
-                    elif file_type == 'text' or 'json' in mime_type:
-                        # It's a text file: read it and add as text
-                        content = self._read_text_file(file_path)
-                        # We wrap the content in markers for clarity
-                        formatted_content = f"""
----
-File Name: {file_path}
-Content:
-{content}
----
-"""
-                        message_parts.append({
-                            "type": "text",
-                            "text": formatted_content
-                        })
-                    else:
-                        logger.info(f"Warning: Skipping unsupported file type: {file_path} (MIME: {mime_type})")
-                else:
-                    # Fallback for unknown extensions
-                    if file_path.endswith(('.txt', '.csv', '.json', '.py', '.md')):
-                        content = self._read_text_file(file_path)
-                        formatted_content = f"""
----
-File Name: {file_path}
-Content:
-{content}
----
-"""
-                        message_parts.append({
-                            "type": "text",
-                            "text": formatted_content
-                        })
-                    else:
-                        logger.info(f"Warning: Skipping unknown file type: {file_path}")
+#                     if file_type == 'image':
+#                         encoded_image = self.encode_image(file_path)
+#                         message_parts.append({
+#                             "type": "image_url",
+#                             "image_url": {
+#                                 "url": f"data:{mime_type};base64,{encoded_image}"
+#                             }
+#                         })
+#                     elif file_type == 'csv' in mime_type:
+#                         try:
+#                             dataset_info = self._synthesis_dataset_info(filepath=file_path)
+#                             message_parts.append({
+#                                 "type": "text",
+#                                 "text": f"The dataset info: {dataset_info}"
+#                             })
+#                         except Exception as e:
+#                             content = self._read_text_file(file_path)
+#                             message_parts.append({
+#                                 "type": "text",
+#                                 "text": f"The dataset: {content[:1000]}"
+#                             })
+#                     elif file_type == 'text' or 'json' in mime_type:
+#                         # It's a text file: read it and add as text
+#                         content = self._read_text_file(file_path)
+#                         # We wrap the content in markers for clarity
+#                         formatted_content = f"""
+# ---
+# File Name: {file_path}
+# Content:
+# {content}
+# ---
+# """
+#                         message_parts.append({
+#                             "type": "text",
+#                             "text": formatted_content
+#                         })
+#                     else:
+#                         logger.info(f"Warning: Skipping unsupported file type: {file_path} (MIME: {mime_type})")
+#                 else:
+#                     # Fallback for unknown extensions
+#                     if file_path.endswith(('.txt', '.csv', '.json', '.py', '.md')):
+#                         content = self._read_text_file(file_path)
+#                         formatted_content = f"""
+# ---
+# File Name: {file_path}
+# Content:
+# {content}
+# ---
+# """
+#                         message_parts.append({
+#                             "type": "text",
+#                             "text": formatted_content
+#                         })
+#                     else:
+#                         logger.info(f"Warning: Skipping unknown file type: {file_path}")
                         
-            except Exception as e:
-                print(f"Error processing file {file_path}: {e}" ,extra={'component': self._collect_file_list_data.__name__})
+#             except Exception as e:
+#                 print(f"Error processing file {file_path}: {e}" ,extra={'component': self._collect_file_list_data.__name__})
 
-        return message_parts
+#         return message_parts
 
-    def _generate_task_graph(self, human_input:str, sess_id: str, file_list: List[str]):
+    def generate_plan(self, human_input:str, file_list: List[Dict[str, Any]]):
         """Generates a task graph"""
         structured_llm = self.llm.with_structured_output(PydanticTaskGraph)
 
-        message_parts = self._collect_file_list_data(file_list=file_list, sess_id=sess_id)
         messages = [
             SystemMessage(content= self.sys_instructions),
-            HumanMessage(content=message_parts),
+            HumanMessage(content=file_list),
             HumanMessage(content=f"User request: {human_input}")
         ]
 
@@ -518,7 +515,7 @@ Content:
                 print(f"    Dependencies: {node.dependencies or 'None'}")
             print("--------------------")
 
-    def run_workflow(self, agent_state: GlobalAgentState, stop_on_failure: bool = True, progress_callback: Union[callable, None] = None) -> GlobalAgentState:
+    def execute_pipeline(self, initial_state: GlobalAgentState, workspace: SessionWorkspace, stop_on_failure: bool = True, progress_callback: Union[callable, None] = None) -> GlobalAgentState:
         """
         Run tasks in topological order. For each TaskNode:
           - evaluate optional `condition` (simple eval with limited globals),
@@ -531,7 +528,7 @@ Content:
         if not order:
             raise RuntimeError("No execution order (empty graph or cycle detected).")
 
-        current_state: GlobalAgentState = deepcopy(agent_state)
+        current_state: GlobalAgentState = deepcopy(initial_state)
 
         for tid in order:
             if tid not in self.nodes:
@@ -543,7 +540,7 @@ Content:
             if progress_callback:
                 progress_callback(f'Initializing task {tid}')
 
-            node.iterative_refining(global_agent_state=current_state)
+            node.execute_with_retry(global_agent_state=current_state, workspace=workspace)
             if node.status is TaskStatus.FAILED:
                 logger.info(f'Iterate refining for Task Node {node.node_id} failed to run in limit {self.max_retries}: {node.action_graph.result}')
                 if progress_callback:

@@ -1,11 +1,13 @@
 import os, logging
 from typing import List, Union
+from contextlib import contextmanager
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 from core.config import config
 from .schemas import GlobalAgentState
-from .utils import load_prompt, write_response_txt
+from .utils import load_prompt, write_response_txt, SessionWorkspace
+from .file_utils import FileUtils
 from .graph import TaskGraph
 from .sub_agents import AnalysisAgent
 
@@ -32,6 +34,28 @@ class MasterAgent:
         self.task_graph: TaskGraph = TaskGraph(model=config.OPENAI_MODEL)
         self.analysis_agent = AnalysisAgent(model=config.OPENAI_MODEL)
     
+
+    @contextmanager
+    def _session_logger(self, workspace: SessionWorkspace):
+        """Context manager to handle session-specific logging setup/teardown."""
+        log_path = workspace.get_log_path()
+
+        handler = logging.FileHandler(log_path)
+        sess_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(sess_formatter)
+        handler.setLevel(logging.DEBUG)
+        
+        sess_logger = logging.getLogger(config.SESS_LOG_NAME)
+        sess_logger.setLevel(logging.DEBUG)
+        sess_logger.addHandler(handler)
+        # ... setup handler ...
+        sess_logger = logging.getLogger(config.SESS_LOG_NAME)
+        sess_logger.addHandler(handler)
+        try:
+            yield sess_logger
+        finally:
+            sess_logger.removeHandler(handler)
+            handler.close()
 
     def _collect_visualization_paths(self, sess_id:str, run_id:str) -> list[str]:
         """
@@ -61,6 +85,7 @@ class MasterAgent:
         # Sort for consistent ordering
         return sorted(image_paths)
 
+    # Not in use
     def _write_agent_state_to_json(self, sess_id: str, run_id: str, agent_state, ensure_dir: bool = True, indent: int = 1) -> None:
         """
         Write agent_state (GraphState or plain dict) to a JSON file.
@@ -88,12 +113,12 @@ class MasterAgent:
         # TODO
         raise RuntimeError('Need dev')
     
-    def _initialize_agent_state(self, sess_id:str, run_id: str, requirement:str, file_list: List[str]) -> GlobalAgentState:
-        state_dict = {'sess_id':sess_id, 'run_id':run_id, 'requirement':requirement, 'num_steps':0, 'raw_data_filenames':file_list, 'evaluation_results':[], 'visualization_paths':[], 'agent_messages':[]}
+    def _initialize_agent_state(self, workplace:SessionWorkspace, requirement:str, file_list: List[str]) -> GlobalAgentState:
+        state_dict = {'sess_id':workplace.sess_id, 'run_id':workplace.run_id, 'requirement':requirement, 'num_steps':0, 'raw_data_filenames':file_list, 'evaluation_results':[], 'visualization_paths':[], 'agent_messages':[]}
         state: GlobalAgentState = state_dict # type: ignore
         return state
     
-    def _provide_answer(self, state: GlobalAgentState) -> str:
+    def _generate_final_report(self, state: GlobalAgentState) -> str:
         messages = [
             SystemMessage(content= self.instructions_ans),
             AIMessage(content=f'evaluation results:{str(state["evaluation_results"])}'),
@@ -161,56 +186,112 @@ class MasterAgent:
         sess_logger.info(f"\nSummary: {results['success']} run items moved, {results['failed']} failed")
         return results
 
-    # Not in use
-    def _migrate_all_current_run_data(self, sess_id:str, run_id:str, create_dest: bool = True):
-        """
-        Move all current run files {config.SESSION_FILEPATH}/{sess_id}/{run_id}.
+    def run_request(self, 
+                    human_input: str, 
+                    file_list: List[str], 
+                    workspace: SessionWorkspace,
+                    progress_callback=None) -> str:
         
-        Args:
-            sess_id: Session ID
-            run_id: Run ID
-            create_dest: Create destination directory if it doesn't exist (default: True)
-            
-        Returns:
-            Dictionary with results: {'success': int, 'failed': int, 'errors': list}
-        """
-        import shutil
-        from pathlib import Path
-        results = {'success': 0, 'failed': 0, 'errors': []}
-    
-        # Convert to Path objects
-        source_dir = Path(os.path.join(config.TEMP_FILEPATH, sess_id))
-        dest_dir = Path(os.path.join(config.SESSION_FILEPATH, sess_id))
+        import time
+        workspace = SessionWorkspace(workspace.sess_id, workspace.run_id)
         
-        # Check if source exists
-        if not source_dir.exists():
-            raise FileNotFoundError(f"Source directory does not exist: {source_dir}")
-        
-        if not source_dir.is_dir():
-            raise NotADirectoryError(f"Source path is not a directory: {source_dir}")
-        
-        # Create destination if needed
-        if create_dest:
-            dest_dir.mkdir(parents=True, exist_ok=True)
-        elif not dest_dir.exists():
-            raise FileNotFoundError(f"Destination directory does not exist: {dest_dir}")
-        
-        # Move all folders/files
-        for item_name in os.listdir(source_dir):
-            try:
-                source_path = os.path.join(source_dir, item_name)
-                target_path = os.path.join(dest_dir, item_name)
-                shutil.move(source_path, target_path)
-                results['success'] += 1
-            except Exception as e:
-                results['failed'] += 1
-                results['errors'].append(f"{item_name}: {str(e)}")
-        
-        print(f"\nSummary: {results['success']} files moved, {results['failed']} failed")
-        return results
+        start_time = time.time()
+        log_summary_extra = {
+            'sess_id': workspace.sess_id,
+            'run_id': workspace.run_id,
+            'user_request': human_input,
+            'model':{'name':config.OPENAI_MODEL,'timeout':config.TIMEOUT,'cache':config.CACHE,'temperature':config.TEMPERATURE,'max_tokens':config.MAX_COMPLETION_TOKENS}
+        }
 
+        status = 'failure'
+        state = self._initialize_agent_state(workplace=workspace, requirement=human_input, file_list=file_list)
+        agent_state_version = {'initial':state}
+
+        with self._session_logger(workspace) as logger:
+            try:
+                
+                file_context = FileUtils.format_files_for_llm(file_list, workspace.data_dir)
+                
+                if len(self.task_graph.nodes) == 0:
+                    logger.info('Initiating TaskGraph')
+                    if progress_callback:
+                        progress_callback(f'Initiating TaskGraph')
+                    self.task_graph.generate_plan(human_input, file_context)
+                else:
+                    logger.info('Updating TaskGraph')
+                    if progress_callback:
+                        progress_callback(f'Starting to refine TaskGraph')
+                    self._refine_task_graph_on_additional_request()
+            
+                workflow_state = self.task_graph.execute_pipeline(
+                    initial_state=state, 
+                    workspace=workspace,
+                    progress_callback=progress_callback
+                )
+                self.task_graph.print_graph(sess_id=state['sess_id'], run_id=state['run_id'], verbose=True)
+                agent_state_version['after workflow'] = workflow_state
+                
+                if progress_callback:
+                    progress_callback(f'Analysis in Progress') 
+                final_state = self._analyze_results(workflow_state, workspace)
+                agent_state_version['final'] = final_state
+                
+                if progress_callback:
+                    progress_callback(f'Fabricating Final Answer')
+                answer = self._generate_final_report(agent_state_version)
+                status = "success"
+
+                return answer
+
+            except Exception as e:
+                logger.error(f"Run failed: {e}", exc_info=True)
+                return "An error occurred during execution."
+            
+            finally:
+                duration_sec = time.time() - start_time
+                log_summary_extra['status'] = status
+                log_summary_extra['duration_sec'] = round(duration_sec, 2)
+                c_logger.info(
+                    f"Finished request",
+                    extra=log_summary_extra
+                )
+                workspace.save_json("agent_state.json", final_state)
+                logger.info(f"Closing log handler for run_id {workspace.run_id}")
+
+                
+    def _analyze_results(self, state: GlobalAgentState, workspace: SessionWorkspace) -> GlobalAgentState:
+        """
+        Checks the workspace for generated figures and triggers the 
+        AnalysisAgent if any are found.
+        """
+        # 1. Ask the workspace what images exist
+        diagram_paths = workspace.list_figures()
+        
+        # 2. Update the state with these paths so the AnalysisAgent knows what to look at
+        # We create a copy to avoid mutating the state passed in unexpectedly, 
+        # though AnalysisAgent usually returns a new state anyway.
+        state['visualization_paths'] = diagram_paths
+
+        # 3. If no diagrams were created, we might skip analysis or just return state
+        if not diagram_paths:
+            c_logger.info("No diagrams found to analyze.")
+            return state
+
+        # 4. Trigger the Analysis Agent
+        # The prompt asks for insights specifically regarding the user's original requirement.
+        prompt = f"Give insights on these diagrams regarding user request: {state['requirement']}"
+        
+        # Note: integration with your existing AnalysisAgent logic
+        final_state = self.analysis_agent.analyze_all_diagrams(
+            state=state, 
+            prompt=prompt
+        )
+        
+        return final_state
+    
     def process_requirement(self, human_input:str, file_list: List[str], sess_id: str, run_id: str, progress_callback: Union[callable, None]) -> str:
         import time
+        workspace = SessionWorkspace(sess_id, run_id)
 
         start_time = time.time()
         log_summary_extra = {
@@ -260,7 +341,7 @@ class MasterAgent:
                 self._refine_task_graph_on_additional_request()
 
 
-            workflow_state = self.task_graph.run_workflow(agent_state=state, progress_callback=progress_callback)
+            workflow_state = self.task_graph.execute_pipeline(initial_state=state, progress_callback=progress_callback)
             self.task_graph.print_graph(sess_id=state['sess_id'], run_id=state['run_id'], verbose=True)
             agent_state_version['after workflow'] = workflow_state
             
@@ -277,7 +358,7 @@ class MasterAgent:
                 progress_callback(f'Fabricating Final Answer')
 
             # Synthesis final response
-            response_str = self._provide_answer(state=final_state)
+            response_str = self._generate_final_report(state=final_state)
             write_response_txt(response=str(response_str), sess_id=state['sess_id'], run_id=state['run_id'])
 
             # self._migrate_run_outputs(sess_id=state['sess_id'], run_id=state['run_id'])
