@@ -540,11 +540,11 @@ class TaskGraph:
             if progress_callback:
                 progress_callback(f'Initializing task {tid}')
 
-            node.execute_with_retry(global_agent_state=current_state, workspace=workspace)
+            node.execute_with_retry(global_agent_state=current_state, workspace=workspace, max_retries=config.TASK_NODE_MAX_RETRIES)
             if node.status is TaskStatus.FAILED:
-                logger.info(f'Iterate refining for Task Node {node.node_id} failed to run in limit {self.max_retries}: {node.action_graph.result}')
+                logger.info(f'{node.node_id} failed to run in {self.max_retries} trials. Refining TaskGraph...')
                 if progress_callback:
-                    progress_callback(f'Iterate refining for Task Node {node.node_id} failed to run in limit {self.max_retries}')
+                    progress_callback(f'{node.node_id} failed to run in {self.max_retries} trials. Refining TaskGraph...')
                 self._refine_and_update_task_graph(node.result or '')
 
             try:

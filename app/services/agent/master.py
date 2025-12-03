@@ -138,53 +138,6 @@ class MasterAgent:
         response = self.llm.invoke(messages)
         return response.text
     
-    def _migrate_run_outputs(self, sess_id: str, run_id: str, create_dest: bool = True):
-        """
-        Moves all run-specific outputs (figures, code, state) 
-        from temp to permanent storage.
-        """
-        import shutil
-        from pathlib import Path
-        results = {'success': 0, 'failed': 0, 'errors': []}
-
-        # 1. Define paths
-        source_run_dir = Path(os.path.join(config.TEMP_FILEPATH, sess_id, run_id))
-        dest_run_dir = Path(os.path.join(config.SESSION_FILEPATH, sess_id, run_id))
-        sess_logger = logging.getLogger(config.SESS_LOG_NAME)
-
-        # 2. Check source
-        if not source_run_dir.exists():
-            sess_logger.warning(f"No temp run directory found at {source_run_dir}, skipping run migration.")
-            return results
-
-        if not source_run_dir.is_dir():
-            raise NotADirectoryError(f"Source path is not a directory: {source_run_dir}")
-
-        # 3. Create destination
-        if create_dest:
-            dest_run_dir.mkdir(parents=True, exist_ok=True)
-        elif not dest_run_dir.exists():
-            raise FileNotFoundError(f"Destination directory does not exist: {dest_run_dir}")
-
-        # 4. Move all contents of the run directory
-        #    We move the directory itself for simplicity.
-        try:
-            # We can't move a dir to a pre-existing dir, so we move its contents
-            for item_name in os.listdir(source_run_dir):
-                source_path = source_run_dir / item_name
-                target_path = dest_run_dir / item_name
-                shutil.move(str(source_path), str(target_path))
-                results['success'] += 1
-            
-            # Clean up the now-empty source run dir
-            source_run_dir.rmdir()
-            
-        except Exception as e:
-            results['failed'] = 1 # We tried to move the whole dir
-            results['errors'].append(f"{source_run_dir.name}: {str(e)}")
-        
-        sess_logger.info(f"\nSummary: {results['success']} run items moved, {results['failed']} failed")
-        return results
 
     def run_request(self, 
                     human_input: str, 
@@ -203,7 +156,7 @@ class MasterAgent:
             'model':{'name':config.OPENAI_MODEL,'timeout':config.TIMEOUT,'cache':config.CACHE,'temperature':config.TEMPERATURE,'max_tokens':config.MAX_COMPLETION_TOKENS}
         }
 
-        status = 'failure'
+        status = 'FAILED'
         state = self._initialize_agent_state(workplace=workspace, requirement=human_input, file_list=file_list)
         agent_state_version = {'initial':state}
 
@@ -239,7 +192,7 @@ class MasterAgent:
                 if progress_callback:
                     progress_callback(f'Fabricating Final Answer')
                 answer = self._generate_final_report(agent_state_version)
-                status = "success"
+                status = "SUCCESS"
 
                 return answer
 

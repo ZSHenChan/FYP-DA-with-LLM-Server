@@ -42,7 +42,7 @@ class ServerSettings(BaseSettings):
     
     # Timeouts & Intervals (New)
     API_TIMEOUT: int = Field(30, description="General request timeout in seconds")
-    KEEPALIVE_INTERVAL: int = Field(5, description="Ping interval in seconds for websockets/streaming")
+    KEEPALIVE_INTERVAL: int = Field(20, description="Ping interval in seconds for websockets/streaming")
 
 class DatabaseSettings(BaseSettings):
     """Database, Redis, and Celery connections."""
@@ -76,7 +76,7 @@ class LlmConfig(BaseSettings):
 
 class AgentSettings(BaseSettings):
     """Workflow and Agent logic configuration."""
-    TASK_NODE_MAX_RETRIES: int = 3
+    TASK_NODE_MAX_RETRIES: int = 5
     TASK_GRAPH_MAX_RETRIES: int = 3
     
     # Sentry / Monitoring

@@ -19,13 +19,13 @@ def generate_id(prefix: str | None = None) -> str:
     Generate a shorter run ID using first 8 characters of UUID.
     
     Args:
-        prefix: Prefix for the run ID (default: "run")
+        prefix: Prefix for the run ID
         
     Returns:
         Generated run ID string
         
     Example:
-        - generate_run_id_short() -> "run_a1b2c3d4"
+        - generate_run_id_short(prefix='run') -> "run_a1b2c3d4"
     """
     if not prefix:
         return uuid.uuid4().hex[:config.UUID_LEN]
@@ -45,9 +45,9 @@ async def run_agent_work(
         loop.call_soon_threadsafe(q.put_nowait, data)
 
     async def heartbeat(queue: Queue):
-        """Sends a ping every 20 seconds to keep the connection alive."""
+        """Sends a ping every config.KEEPALIVE_INTERVAL seconds to keep the connection alive."""
         while True:
-            await asyncio.sleep(20)
+            await asyncio.sleep(config.KEEPALIVE_INTERVAL)
             ping_data = json.dumps({"type": "ping", "message": "still-processing"})
             try:
                 # Use call_soon_threadsafe because this runs

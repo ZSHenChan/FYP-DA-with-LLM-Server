@@ -1,5 +1,10 @@
 # FastAPI Boilerplate
 
+## Focus
+
+- Multiturn conversation
+  -- Use json way to store the TaskGraph structure and code
+
 # Features
 
 - Async SQLAlchemy session
