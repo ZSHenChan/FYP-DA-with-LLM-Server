@@ -68,7 +68,7 @@ class DatabaseSettings(BaseSettings):
 class LlmConfig(BaseSettings):
     LLM_MAX_RETRIES: int = 2
     OPENAI_MODEL: str = 'gpt-5-mini-2025-08-07'
-    TIMEOUT: int | None = None
+    TIMEOUT: int | None = 300
     CACHE: bool = False
     TEMPERATURE: float = 0.3
     MAX_COMPLETION_TOKENS: int | None = None

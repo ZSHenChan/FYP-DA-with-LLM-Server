@@ -48,24 +48,55 @@ class SessionWorkspace:
 
     def list_figures(self) -> list[str]:
         """
-        Returns a sorted list of absolute string paths for all images 
+        Returns a sorted list of string paths for all images 
         generated in the current run's figure directory.
         """
+        import glob
+
+        print(f"DEBUG: Looking for figures in: {self.figure_dir.resolve()}")
+        
+        if not self.figure_dir.exists():
+            print("DEBUG: Directory does not exist.")
+            return []
+        
+        all_files = list(self.figure_dir.glob("*"))
+        print(f"DEBUG: Total files found in dir: {[f.name for f in all_files]}")
+    
         image_paths = []
         # We look for extensions defined in your config (e.g., .png, .jpg)
         for ext in config.VISUAL_ALLOWED_EXTENSIONS:
-            # Using pathlib's glob is cleaner than os.glob
-            # pattern e.g., "*.png"
-            pattern = f"*{ext}" if ext.startswith(".") else f"*.{ext}"
-            found = list(self.figure_dir.glob(pattern))
-            image_paths.extend(found)
-        
-        # Sort them so the analysis order is deterministic
-        image_paths.sort(key=lambda p: p.name)
+            pattern = os.path.join(self.figure_dir, ext)
+            image_paths.extend(glob.glob(pattern))
+            # # Using pathlib's glob is cleaner than os.glob
+            # # pattern e.g., "*.png"
+            # pattern = f"*{ext}" if ext.startswith(".") else f"*.{ext}"
+            # found = list(self.figure_dir.glob(pattern))
+            # image_paths.extend(found)
         
         # Convert Path objects to strings for the State dict
         return [str(p) for p in image_paths]
     
+    @property
+    def graph_state_path(self) -> Path:
+        """Path to the persistent JSON representation of the TaskGraph."""
+        # Saving directly in session_base allows Run 2 to easily find Run 1's graph
+        return self.session_base / "task_graph_state.json"
+
+    def save_graph_state(self, graph_dict: dict):
+        import json
+        with open(self.graph_state_path, 'w', encoding='utf-8') as f:
+            json.dump(graph_dict, f, indent=2, ensure_ascii=False)
+
+    def load_graph_state(self) -> dict | None:
+        import json
+        if not self.graph_state_path.exists():
+            return None
+        try:
+            with open(self.graph_state_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return None
+        
 def load_prompt(agent_name, key: str='system_prompt') -> str:
     file_path = f'prompts.json'
     try:

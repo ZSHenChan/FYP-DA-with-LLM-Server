@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import TypedDict, List, Any
+from typing import Optional, TypedDict, List, Any
 from pydantic import BaseModel, Field
 
 # --- TypedDicts ---
@@ -59,6 +59,22 @@ class PydanticTaskNode(BaseModel):
 
 class PydanticTaskGraph(BaseModel):
     task_nodes: List[PydanticTaskNode] = Field(..., description="List of task nodes...")
+
+class PydanticEditAction(str, Enum):
+    ADD = "add"       # Add a completely new task
+    MODIFY = "modify" # Change instruction/dependencies of a PENDING task
+    DELETE = "delete" # Remove a task (and handle its children)
+
+class PydanticGraphEdit(BaseModel):
+    action: PydanticEditAction = Field(..., description="The type of change to apply.")
+    # For DELETE, we only need the ID.
+    # For ADD/MODIFY, we need the full node details.
+    task: Optional[PydanticTaskNode] = Field(None, description="The task details. Required for ADD and MODIFY.")
+    target_task_id: Optional[str] = Field(None, description="The specific ID of the task to DELETE.")
+
+class PydanticGraphModificationPlan(BaseModel):
+    reasoning: str = Field(..., description="Brief explanation of why these changes meet the new requirement.")
+    edits: List[PydanticGraphEdit] = Field(..., description="List of atomic edits to apply to the graph.")
 
 class PydanticMasterResult(BaseModel):
     response: str = Field(..., description="analysis result summary...")

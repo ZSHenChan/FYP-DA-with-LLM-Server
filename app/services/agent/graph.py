@@ -9,7 +9,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from core.config import config
 from .schemas import (
     GlobalAgentState, PydanticActionGraph, TaskStatus, 
-    TaskType, PydanticTaskGraph
+    TaskType, PydanticTaskGraph, PydanticEditAction, PydanticGraphEdit, PydanticGraphModificationPlan
 )
 from .utils import CodeExecutor, ExecuteResult, load_prompt, increase_num_steps, comment_block, SessionWorkspace
 
@@ -26,6 +26,26 @@ class ActionNode:
         self.status = TaskStatus.PENDING
         self.result = None
 
+    def to_dict(self) -> dict:
+        return {
+            "action_id": self.action_id,
+            "code": self.code,
+            "description": self.description,
+            "status": self.status.value,
+            "result": self.result # Ensure result is serializable (str/dict), not an object
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict):
+        node = cls(
+            action_id=data["action_id"],
+            code=data["code"],
+            description=data["description"]
+        )
+        node.status = TaskStatus(data["status"])
+        node.result = data.get("result")
+        return node
+
     def __repr__(self):
         return f"ActionNode(id={self.action_id}, description='{self.description}', status='{self.status.value}', code='{self.code[:30]}...')"
 
@@ -34,6 +54,23 @@ class ActionGraph:
     def __init__(self):
         self.nodes: List[ActionNode] = []
         self.result: ExecuteResult | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "nodes": [node.to_dict() for node in self.nodes],
+            "result_summary": self.result.message if self.result else None,
+            "result_success": self.result.success if self.result else None
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        graph = cls()
+        for node_data in data.get("nodes", []):
+            graph.add_action(ActionNode.from_dict(node_data))
+        
+        # We don't fully reconstruct self.result object here as it's transient,
+        # but we restored the nodes' status which is what matters for history.
+        return graph
 
     def add_action(self, node: ActionNode):
         self.nodes.append(node)
@@ -94,6 +131,38 @@ class TaskNode:
         """Provides a string representation for the task node."""
         return (f"TaskNode(id='{self.node_id}', status='{self.status.value}', "
                 f"instruction='{self.instruction[:30]}...', deps={self.dependencies})")
+    
+    def to_dict(self) -> dict:
+        return {
+            "node_id": self.node_id,
+            "instruction": self.instruction,
+            "dependencies": self.dependencies,
+            "task_type": self.task_type.value,
+            "output": self.output,
+            "status": self.status.value,
+            "result": self.result,
+            "action_graph": self.action_graph.to_dict(),
+            "model_name": self.llm.model_name # Persist which model created this
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict):
+        node = cls(
+            node_id=data["node_id"],
+            instruction=data["instruction"],
+            dependencies=data["dependencies"],
+            task_type=TaskType(data["task_type"]),
+            output=data["output"],
+            model=data.get("model_name", config.OPENAI_MODEL) # Restore model or default
+        )
+        
+        node.status = TaskStatus(data["status"])
+        node.result = data.get("result")
+        
+        if "action_graph" in data:
+            node.action_graph = ActionGraph.from_dict(data["action_graph"])
+            
+        return node
 
     def plan_actions(self, global_agent_state: GlobalAgentState, workspace: SessionWorkspace, namespace: dict, tool_sets=[], additional_instruction: str = "", conversation_history: list = []) -> ActionGraph:
         structured_llm = self.llm.with_structured_output(PydanticActionGraph)
@@ -135,7 +204,7 @@ class TaskNode:
           """Generate and refine the ActionGraph within a trial limit."""
           debug_agent_state: GlobalAgentState = deepcopy(global_agent_state)
           
-          namespace = {'agent_state':{}}
+          namespace = {'agent_state': deepcopy(debug_agent_state)}
 
           self.conversation_history = []
 
@@ -143,7 +212,8 @@ class TaskNode:
           self.action_graph = action_graph
 
           for i in range(max_retries):
-              namespace = {'agent_state':{}}
+              namespace = {'agent_state': deepcopy(debug_agent_state)}
+              
               logger.debug(f"Trial {i+1}")
               self.action_graph.execute_action_graph(namespace)
 
@@ -230,11 +300,15 @@ class TaskNode:
         agent_state_copy = deepcopy(agent_state)
 
         self.action_graph.execute_action_graph(namespace)
+
         if self.action_graph.result is not None and self.action_graph.result.success:
-            # Update current agent work to Global Agent State
-            final_state = self.action_graph.result.namespace.get('agent_state',{})
-            if final_state:
-                agent_state_copy['agent_messages'].append({'sender': self.task_type + ' agent', 'content':final_state})
+            modified_inner_state = self.action_graph.result.namespace.get('agent_state', {})
+            
+            execution_log = {
+                'sender': f"{self.task_type.value} agent", 
+                'message': modified_inner_state
+            }
+            agent_state_copy['agent_messages'].append(execution_log)
             return agent_state_copy
         else:
             raise RuntimeError(f'Failed to run ActionGraph {self.node_id}: {self.action_graph.result}')
@@ -245,6 +319,7 @@ class TaskGraph:
         self.max_retries: int = max_retries
         self.nodes: dict[str, TaskNode] = {}
         self.sys_instructions: str = load_prompt(agent_name='master')
+        self.sys_instructions_refine: str = load_prompt(agent_name='master', key='system_prompt_refine')
         self.llm: ChatOpenAI = ChatOpenAI(
             model=model,
             openai_api_key=OPENAI_API_KEY,
@@ -253,6 +328,21 @@ class TaskGraph:
             timeout=config.TIMEOUT,
             max_retries=config.LLM_MAX_RETRIES
           )
+        
+    def to_dict(self) -> dict:
+        return {
+            "nodes": {
+                tid: node.to_dict() for tid, node in self.nodes.items()
+            }
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict, model: str = config.OPENAI_MODEL):
+        graph = cls(model=model)
+        for tid, node_data in data.get("nodes", {}).items():
+            node = TaskNode.from_dict(node_data)
+            graph.nodes[tid] = node
+        return graph
 
     def add_task(self, task: TaskNode, replace: bool = False):
         """Adds a TaskNode to the graph.
@@ -270,6 +360,80 @@ class TaskGraph:
             raise ValueError(f"Task with id '{task.node_id}' already exists. Pass replace=True to overwrite.")
         self.nodes[task.node_id] = task
 
+    def apply_edits(self, plan: PydanticGraphModificationPlan):
+        """
+        Applies a list of atomic edits to the current graph.
+        """
+        logger.info(f"Applying Graph Plan: {plan.reasoning}")
+
+        for edit in plan.edits:
+            try:
+                if edit.action == PydanticEditAction.ADD:
+                    self._handle_add(edit.task)
+                elif edit.action == PydanticEditAction.MODIFY:
+                    self._handle_modify(edit.task)
+                elif edit.action == PydanticEditAction.DELETE:
+                    self._handle_delete(edit.target_task_id)
+            except Exception as e:
+                logger.error(f"Failed to apply edit {edit}: {e}")
+                # Decide: Continue or Raise? Usually better to continue best-effort.
+
+    def _handle_add(self, p_node):
+        if not p_node: 
+            return
+        # Create new node
+        new_node = TaskNode(
+            node_id=p_node.task_id,
+            instruction=p_node.instruction,
+            dependencies=p_node.dependencies,
+            task_type=p_node.task_type,
+            output=p_node.output,
+            model=config.OPENAI_MODEL
+        )
+        # Verify dependencies exist
+        missing_deps = [d for d in new_node.dependencies if d not in self.nodes]
+        if missing_deps:
+            logger.warning(f"Task {new_node.node_id} depends on unknown tasks: {missing_deps}. Adding anyway, but graph may break.")
+        
+        self.add_task(new_node)
+        logger.info(f"Added Task {new_node.node_id}")
+
+    def _handle_modify(self, p_node):
+        if not p_node or p_node.task_id not in self.nodes:
+            logger.warning(f"Cannot modify unknown task {getattr(p_node, 'task_id', 'Unknown')}")
+            return
+        
+        existing_node = self.nodes[p_node.task_id]
+        
+        # SAFETY CHECK: Don't modify completed work unless you implement a reset mechanism
+        # if existing_node.status == TaskStatus.SUCCESS:
+        #     logger.warning(f"Refusing to modify completed task {existing_node.node_id}. Please use a new task instead.")
+        #     return
+
+        # Update fields
+        existing_node.instruction = p_node.instruction
+        existing_node.dependencies = p_node.dependencies
+        existing_node.output = p_node.output
+        existing_node.status = TaskStatus.PENDING
+        logger.info(f"Modified Task {existing_node.node_id}")
+    
+    def _handle_delete(self, node_id: str):
+        if node_id not in self.nodes:
+            return
+        
+        # SAFETY CHECK: Orphan Prevention
+        # If any other node depends on this one, we cannot delete it safely.
+        dependents = [
+            tid for tid, node in self.nodes.items() 
+            if node_id in node.dependencies
+        ]
+        if dependents:
+            logger.warning(f"Deleting task {node_id}; tasks {dependents} depend on it.")
+            # return
+
+        del self.nodes[node_id]
+        logger.info(f"Deleted Task {node_id}")
+
     def _read_text_file(self, file_path: str) -> str:
         """Reads a text-based file (txt, csv, json, etc.) into a string."""
         try:
@@ -279,91 +443,17 @@ class TaskGraph:
             logger.error(f"Error reading {file_path}: {e}")
             return f"Error reading file: {file_path}"
     
-    def _synthesis_dataset_info(self, filepath: str) -> str:
-        import io
-        import pandas as pd
-        df = pd.read_csv(filepath)
+    # def _synthesis_dataset_info(self, filepath: str) -> str:
+    #     import io
+    #     import pandas as pd
+    #     df = pd.read_csv(filepath)
 
-        buffer = io.StringIO()
+    #     buffer = io.StringIO()
 
-        df.info(buf=buffer)
+    #     df.info(buf=buffer)
 
-        return buffer.getvalue()
+    #     return buffer.getvalue()
     
-    # Not in use
-#     def _collect_file_list_data(self, file_list: List[str], sess_id: str) -> List[Dict[str, Union[str, Dict[str, str]]]]:
-#         import mimetypes
-#         from pathlib import Path
-#         message_parts: List[Dict[str, Union[str, Dict[str, str]]]] = []
-
-#         for filename in file_list:
-#             file_path = Path(os.path.join(config.SESSION_FILEPATH, sess_id, config.DATA_FILEPATH, filename))
-#             try:
-#                 mime_type, _ = mimetypes.guess_type(file_path)
-                
-#                 if mime_type:
-#                     file_type = mime_type.split('/')[0]
-                    
-#                     if file_type == 'image':
-#                         encoded_image = self.encode_image(file_path)
-#                         message_parts.append({
-#                             "type": "image_url",
-#                             "image_url": {
-#                                 "url": f"data:{mime_type};base64,{encoded_image}"
-#                             }
-#                         })
-#                     elif file_type == 'csv' in mime_type:
-#                         try:
-#                             dataset_info = self._synthesis_dataset_info(filepath=file_path)
-#                             message_parts.append({
-#                                 "type": "text",
-#                                 "text": f"The dataset info: {dataset_info}"
-#                             })
-#                         except Exception as e:
-#                             content = self._read_text_file(file_path)
-#                             message_parts.append({
-#                                 "type": "text",
-#                                 "text": f"The dataset: {content[:1000]}"
-#                             })
-#                     elif file_type == 'text' or 'json' in mime_type:
-#                         # It's a text file: read it and add as text
-#                         content = self._read_text_file(file_path)
-#                         # We wrap the content in markers for clarity
-#                         formatted_content = f"""
-# ---
-# File Name: {file_path}
-# Content:
-# {content}
-# ---
-# """
-#                         message_parts.append({
-#                             "type": "text",
-#                             "text": formatted_content
-#                         })
-#                     else:
-#                         logger.info(f"Warning: Skipping unsupported file type: {file_path} (MIME: {mime_type})")
-#                 else:
-#                     # Fallback for unknown extensions
-#                     if file_path.endswith(('.txt', '.csv', '.json', '.py', '.md')):
-#                         content = self._read_text_file(file_path)
-#                         formatted_content = f"""
-# ---
-# File Name: {file_path}
-# Content:
-# {content}
-# ---
-# """
-#                         message_parts.append({
-#                             "type": "text",
-#                             "text": formatted_content
-#                         })
-#                     else:
-#                         logger.info(f"Warning: Skipping unknown file type: {file_path}")
-                        
-#             except Exception as e:
-#                 print(f"Error processing file {file_path}: {e}" ,extra={'component': self._collect_file_list_data.__name__})
-
-#         return message_parts
 
     def generate_plan(self, human_input:str, file_list: List[Dict[str, Any]]):
         """Generates a task graph"""
@@ -376,7 +466,6 @@ class TaskGraph:
         ]
 
         pydantic_response: PydanticTaskGraph = structured_llm.invoke(messages) # type: ignore
-        # pydantic_response: PydanticTaskGraph = result.content # type: ignore
 
         for pydantic_node in pydantic_response.task_nodes:
             node_data = pydantic_node.model_dump()
@@ -389,18 +478,52 @@ class TaskGraph:
                 model=config.OPENAI_MODEL
             )
             self.add_task(node)
-    
-    def _refine_and_update_task_graph(self, add_instructions:str):
-        # TODO
-        raise RuntimeError(f'failed to run Task Graph: {add_instructions}')
 
-    def initialize_task_graph(self, human_input:str, global_agent_state: GlobalAgentState, file_list: List[str], progress_callback: Union[callable, None] = None):
-        self._generate_task_graph(human_input=human_input, sess_id=global_agent_state['sess_id'], file_list=file_list)
-        increase_num_steps(global_agent_state)
-        logger.info(f'== Task Graph created with {len(self.nodes)} Nodes.')
-        if progress_callback:
-            progress_callback(f'Task Graph created with {len(self.nodes)} Nodes.')
-        self._save_taskgraph_structure(sess_id = global_agent_state["sess_id"], run_id=global_agent_state["run_id"])
+    def refine_plan(self, add_input:str, file_list: List[Dict[str, Any]]):
+        """
+        Takes an existing populated graph and asks the LLM to add/modify nodes
+        based on new user input.
+        """
+        # 1. Serialize current state for the LLM context
+        current_graph_summary = []
+        for tid, node in self.nodes.items():
+            current_graph_summary.append(
+                f"- Task {tid} ({node.status.value}): {node.instruction}. Output: {node.output}"
+            )
+        current_graph_str = "\n".join(current_graph_summary)
+
+        # 2. Construct Prompt
+        # We need a specific prompt that tells the LLM: "Don't reinvent the wheel.
+        # Only add new tasks for the new requirement. Mark dependencies on old tasks."
+        
+        system_msg = (
+            f"{self.sys_instructions}\n"
+            f"{self.sys_instructions_refine}\n"
+            f"EXISTING WORKFLOW STATE:\n{current_graph_str}\n\n"
+        )
+
+        # 3. Call LLM (Same logic as generate_plan)
+        structured_llm = self.llm.with_structured_output(PydanticGraphModificationPlan)
+        messages = [
+            SystemMessage(content=system_msg),
+            HumanMessage(content=file_list),
+            HumanMessage(content=f"Follow-up Request: {add_input}")
+        ]
+        
+        pydantic_response: PydanticGraphModificationPlan = structured_llm.invoke(messages)
+
+        # 4. Merge Logic
+        # We assume the LLM returns the changes made only.
+        
+        self.apply_edits(pydantic_response)
+
+    # def initialize_task_graph(self, human_input:str, global_agent_state: GlobalAgentState, file_list: List[str], progress_callback: Union[callable, None] = None):
+    #     self._generate_task_graph(human_input=human_input, sess_id=global_agent_state['sess_id'], file_list=file_list)
+    #     increase_num_steps(global_agent_state)
+    #     logger.info(f'== Task Graph created with {len(self.nodes)} Nodes.')
+    #     if progress_callback:
+    #         progress_callback(f'Task Graph created with {len(self.nodes)} Nodes.')
+    #     self._save_taskgraph_structure(sess_id = global_agent_state["sess_id"], run_id=global_agent_state["run_id"])
 
     def _get_execution_order(self) -> list[str]:
         """
@@ -536,6 +659,15 @@ class TaskGraph:
                 continue
 
             node = self.nodes[tid]
+            if node.status == TaskStatus.SUCCESS:
+                logger.info(f"Skipping already completed task {tid}")
+                # IMPORTANT: You must still apply the result of this node 
+                # to the current_state so downstream nodes have context!
+                if node.result: 
+                    # Replay the side-effect on state if needed, 
+                    # or ensure state carries over from previous run.
+                    pass 
+                continue
             logger.info(f"== Initializing task {tid}")
             if progress_callback:
                 progress_callback(f'Initializing task {tid}')
@@ -545,7 +677,7 @@ class TaskGraph:
                 logger.info(f'{node.node_id} failed to run in {self.max_retries} trials. Refining TaskGraph...')
                 if progress_callback:
                     progress_callback(f'{node.node_id} failed to run in {self.max_retries} trials. Refining TaskGraph...')
-                self._refine_and_update_task_graph(node.result or '')
+                self.refine_plan(f'Node with id {node.node_id} failed to run within {config.TASK_NODE_MAX_RETRIES} tries. Make changes to the Node and try again.')
 
             try:
                 current_state = node.run_action_graph(agent_state=current_state)

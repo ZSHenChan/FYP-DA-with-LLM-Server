@@ -1,4 +1,4 @@
-import json, os
+import json, os, logging
 import asyncio
 from asyncio import Queue
 from core.config import config
@@ -12,6 +12,8 @@ from app.services.agent.utils import SessionWorkspace
 process_router = APIRouter()
 
 SESSION_QUEUES: Dict[str, Queue] = {}
+
+logger = logging.getLogger(__name__)
 
 def generate_id(prefix: str | None = None) -> str:
     import uuid
@@ -87,39 +89,50 @@ async def run_agent_work(
 
 @process_router.post("")
 async def start_processing(
+    request: Request,
     prompt: str = Form(...),
-    files: List[UploadFile] = Form(...)
+    session_id: Optional[str] = Form(None),
+    files: List[UploadFile] = File(default=[])
 ):
     from pathlib import Path
-    session_id = generate_id(prefix='sess')
+
+    if session_id:
+        # Validate if session actually exists on disk to prevent phantom sessions
+        # (Optional security check)
+        potential_path = Path(config.SESSION_FILEPATH) / session_id
+        if not potential_path.exists():
+            # You can either raise error or just create a new one. 
+            # Creating new is usually safer for UX.
+            logger.warning(f"Session {session_id} not found, creating new.")
+            session_id = generate_id(prefix='sess')
+    else:
+        session_id = generate_id(prefix='sess')
+
     run_id = generate_id(prefix='run')
     
     q = Queue()
-    if session_id in SESSION_QUEUES:
-        raise HTTPException(status_code=500, detail="Session ID collision")
-    
     SESSION_QUEUES[session_id] = q
 
     workspace = SessionWorkspace(session_id, run_id)
-    dest_dir = workspace.data_dir
     file_names: List[str] = []
 
-    if files and len(files) > 0:
+    # Save new files (if any)
+    if files:
         try:
             for file in files:
-                filename = Path(file.filename).name
-                file_path = dest_dir / filename
+                if not file.filename: continue
                 
-                file_content = await file.read()
+                file_path = workspace.data_dir / Path(file.filename).name
+                
+                # Async read/write
+                content = await file.read()
                 with open(file_path, "wb") as f:
-                    f.write(file_content)
-                
-                file_names.append(filename)
-                
+                    f.write(content)
+                file_names.append(file.filename)
         except Exception as e:
             SESSION_QUEUES.pop(session_id, None)
-            raise HTTPException(status_code=500, detail=f"Failed to save one or more files: {e}")
-
+            raise HTTPException(status_code=500, detail=f"File save failed: {e}")
+        
     master_agent = get_master_agent()
     asyncio.create_task(
         run_agent_work(
@@ -134,43 +147,49 @@ async def start_processing(
     # Return the session_id
     return JSONResponse({"status": "success", "session_id": session_id})
 
-@inject
-async def response_generator(session_id: str, request: Request):
-    q = SESSION_QUEUES.get(session_id)
-    
-    if not q:
-        data = json.dumps({"type": "error", "message": "Invalid or expired session ID"})
-        yield f"data: {data}\n\n"
-        yield f"data: [DONE]\n\n"
-        return
-    
-    try:
-          while True:
-              if await request.is_disconnected():
-                  print(f"Client for {session_id} disconnected.")
-                  break
-              
-              try:
-                  msg = await asyncio.wait_for(q.get(), timeout=1.0)
-                  
-                  if msg == "[DONE]":
-                      yield f"data: [DONE]\n\n"
-                      break
-                  
-                  yield f"data: {msg}\n\n"
-                  q.task_done()
-              
-              except asyncio.TimeoutError:
-                  continue
-                  
-    except asyncio.CancelledError:
-        print(f"Generator for {session_id} was cancelled.")
-    
-    finally:
-        # Clean up the queue from the global dict
-        print(f"Cleaning up queue for {session_id}")
-        SESSION_QUEUES.pop(session_id, None)
-
 @process_router.get("/events/{session_id}")
 async def stream_progress(request: Request, session_id: str):
-    return StreamingResponse(response_generator(session_id=session_id, request=request), media_type="text/event-stream")
+    async def event_generator():
+        q = SESSION_QUEUES.get(session_id)
+        
+        if not q:
+            # Send an error event then close
+            err = json.dumps({"type": "error", "message": "Session expired or invalid"})
+            yield f"data: {err}\n\n"
+            yield f"data: [DONE]\n\n"
+            return
+        
+        yield f": connected\n\n"
+        
+        try:
+            while True:
+                # Check for client disconnect
+                if await request.is_disconnected():
+                    logger.info(f"Client {session_id} disconnected")
+                    break
+                
+                try:
+                    # Wait for message with timeout to allow checking disconnect status
+                    msg = await asyncio.wait_for(q.get(), timeout=1.0)
+                    
+                    if msg == "[DONE]":
+                        yield f"data: [DONE]\n\n"
+                        break
+                    
+                    yield f"data: {msg}\n\n"
+                    q.task_done()
+                
+                except asyncio.TimeoutError:
+                    # Just loop back to check connection status
+                    continue
+                    
+        except asyncio.CancelledError:
+            logger.info(f"Stream cancelled for {session_id}")
+        
+        finally:
+            # Cleanup: Remove the queue to free memory
+            # In a chat app, we remove it because the response is done.
+            # The next POST /start will create a NEW queue.
+            SESSION_QUEUES.pop(session_id, None)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
