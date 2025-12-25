@@ -2,24 +2,6 @@ from enum import Enum
 from typing import Optional, TypedDict, List, Any
 from pydantic import BaseModel, Field
 
-# --- TypedDicts ---
-
-class AgentMessage(TypedDict):
-    """Represents a structured message from an agent to the shared state."""
-    sender: str
-    content: Any
-
-class GlobalAgentState(TypedDict):
-    """A comprehensive state for a data science pipeline."""
-    sess_id: str
-    run_id: str
-    requirement: str
-    num_steps: int
-    raw_data_filenames: List[str]
-    evaluation_results: List[AgentMessage]
-    visualization_paths: List[str]
-    agent_messages: List[AgentMessage]
-
 # --- Enums ---
 
 class TaskStatus(str, Enum):
@@ -39,9 +21,6 @@ class TaskType(str, Enum):
 
 # --- Pydantic Schemas ---
 
-class PydanticAnalysisResult(BaseModel):
-    result: str = Field(..., description="analysis result")
-    
 class PydanticActionNode(BaseModel):
     action_id: int = Field(..., description="The sequential ID...")
     description: str = Field(..., description="A brief, natural language...")
@@ -78,3 +57,34 @@ class PydanticGraphModificationPlan(BaseModel):
 
 class PydanticMasterResult(BaseModel):
     response: str = Field(..., description="analysis result summary...")
+
+class PydanticDiagramResult(BaseModel):
+    filename: str = Field(..., description="The filename of the figure.")
+    text: str = Field(..., description="The explanation of the diagram.")
+
+class PydanticAnalysisResult(BaseModel):
+    summary: PydanticEditAction = Field(..., description="The type of change to apply.")
+    figures: List[PydanticDiagramResult] = Field(..., description="List of selected diagrams to help with explanation.")
+
+# --- TypedDicts ---
+
+class AgentMessage(TypedDict):
+    """Represents a structured message from an agent to the shared state."""
+    sender: str
+    content: Any
+
+class GlobalAgentState(TypedDict):
+    """A comprehensive state for a data science pipeline."""
+    sess_id: str
+    run_id: str
+    requirement: str
+    num_steps: int
+    raw_data_filenames: List[str]
+    visualization_paths: List[str]
+    analysis_result: Optional[PydanticAnalysisResult]
+    agent_messages: List[AgentMessage]
+
+class FinalAnswer(TypedDict):
+    text: str
+    run_id: str
+    figures: List[PydanticDiagramResult] = []

@@ -25,10 +25,20 @@ class ResponseLogMiddleware:
             if message.get("type") == "http.response.start":
                 response_info.headers = Headers(raw=message.get("headers"))
                 response_info.status_code = message.get("status")
+            
             elif message.get("type") == "http.response.body":
                 if body := message.get("body"):
-                    response_info.body += body.decode("utf8")
+                    # --- FIX START ---
+                    try:
+                        # Try to decode as text (JSON, HTML, etc.)
+                        response_info.body += body.decode("utf8")
+                    except UnicodeDecodeError:
+                        # If it fails (Images, PDFs), just log a placeholder
+                        response_info.body += " <binary content> "
+                    # --- FIX END ---
 
             await send(message)
 
         await self.app(scope, receive, _logging_send)
+        
+        # (Presumably, you have code here to actually write the log)

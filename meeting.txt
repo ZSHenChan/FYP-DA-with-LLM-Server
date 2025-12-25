@@ -11,8 +11,12 @@ Report covers:
 - Describe the behavior of system (does it act in different way in certain condition?)
 
 TODO:
+- Figure out angle to start my presentation 
+-- What this is solving
+-- How is it differ from established llms/system design (a literature review)
+
 - Planner to improve existing plan, instead of generating new ideas
-[] How does the planner learn when the process went into error
+[] How does the planner learn when the profcess went into error
 
 - Using differnet llm models (ChatGPT, Gemini etc)
 [] Use Gemini
@@ -29,3 +33,6 @@ TODO:
 
 - AA diagrams selection
 [] Decide which diagrams to present to user, accompanied with explanation
+
+- For presentation
+[] Showing the Graph update progress when waiting for results

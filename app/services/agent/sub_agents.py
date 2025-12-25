@@ -4,7 +4,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from core.config import config
-from .schemas import PydanticAnalysisResult, GlobalAgentState, AgentMessage
+from .schemas import GlobalAgentState, AgentMessage, PydanticDiagramResult, PydanticAnalysisResult
 from .utils import load_prompt
 
 OPENAI_API_KEY = config.OPENAI_API_KEY
@@ -29,29 +29,42 @@ class AnalysisAgent:
         with open(image_path, "rb") as image_file:
             return base64.b64encode(image_file.read()).decode('utf-8')
     
-    def analyze_diagram(self, prompt:str, file_path_list: List[str]) -> str:
+    def analyze_diagram(self, prompt:str, file_path_list: List[str]) -> PydanticAnalysisResult:
         """
         Encodes the image and asks the vision model a question about it.
         """
-       
-        messages = [
-            SystemMessage(content= self.instruction),
-            HumanMessage(content=prompt),
-            HumanMessage(content=[{
+        import os
+        
+        image_content = []
+        for path in file_path_list:
+            filename = os.path.basename(path)
+            image_content.extend([
+                {
+                    "type": "text", 
+                    "text": f"Image Filename: {filename}"
+                },
+                {
                     "type": "image_url",
                     "image_url": {
-                        "url": f"data:image/png;base64,{self._encode_image(x)}"
+                        "url": f"data:image/png;base64,{self._encode_image(path)}"
                     }
-                } for x in file_path_list])
+                }
+            ])
+
+        messages = [
+            SystemMessage(content=self.instruction),
+            # Combine the user's specific question with the labeled images
+            HumanMessage(content=[
+                {"type": "text", "text": prompt},
+                *image_content  # Unpack the list of text and image blocks
+            ])
         ]
 
         structured_llm = self.llm.with_structured_output(PydanticAnalysisResult)
 
         pydantic_response: PydanticAnalysisResult = structured_llm.invoke(messages) # type: ignore
 
-        response_str: str = pydantic_response.result
-
-        return response_str
+        return pydantic_response
     
     def analyze_all_diagrams(self, prompt:str, state: GlobalAgentState) -> GlobalAgentState:
         
@@ -63,12 +76,8 @@ class AnalysisAgent:
         analysis_result: AgentMessage = {'sender': 'Analysis Agent', 'content': []}
 
         # for diagram_path in diagram_list:
-        analysis_result_str = self.analyze_diagram(prompt=prompt, file_path_list=diagram_list)
+        analysis_result_dict: PydanticAnalysisResult = self.analyze_diagram(prompt=prompt, file_path_list=diagram_list)
 
-        analysis_result['content'].append({'analysis_result': analysis_result_str})
-
-        if not state_copy.get('evaluation_results'):
-            state_copy['evaluation_results'] = []
-        state_copy['evaluation_results'].append(analysis_result)
+        state_copy['analysis_result'] = analysis_result_dict
         return state_copy
        

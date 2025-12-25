@@ -1,19 +1,22 @@
-import json, os, logging
+import json, logging, os
 import asyncio
 from asyncio import Queue
-from core.config import config
-from fastapi.responses import StreamingResponse, JSONResponse
-from fastapi import APIRouter, HTTPException,  UploadFile, File, Form, Depends, Path, Request
-from dependency_injector.wiring import Provide, inject
-from app.services.agent import get_master_agent
 from typing import Dict, Union, Optional, List
+from core.config import config
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi import APIRouter, HTTPException,  UploadFile, File, Form, Request
+from app.services.agent import get_master_agent
 from app.services.agent.utils import SessionWorkspace
+from app.services.agent.schemas import FinalAnswer
 
 process_router = APIRouter()
 
 SESSION_QUEUES: Dict[str, Queue] = {}
 
 logger = logging.getLogger(__name__)
+
+DEBUGGING = True
 
 def generate_id(prefix: str | None = None) -> str:
     import uuid
@@ -63,15 +66,26 @@ async def run_agent_work(
     heartbeat_task = asyncio.create_task(heartbeat(q))
             
     try:
-        result = await asyncio.to_thread(
-            master_agent.run_request,
-            human_input,
-            file_names,
-            workspace,
-            progress_callback
-        )
+        if DEBUGGING:
+            result: FinalAnswer = await asyncio.to_thread(
+                master_agent.run_request_demo,
+                human_input,
+                file_names,
+                workspace,
+                progress_callback
+            )
+        else:
+            result: FinalAnswer = await asyncio.to_thread(
+                master_agent.run_request,
+                human_input,
+                file_names,
+                workspace,
+                progress_callback
+            )
+            
+        serializable_result = jsonable_encoder(result)
         
-        final_data = json.dumps({"type": "response", "message": result})
+        final_data = json.dumps({"type": "response", "message": serializable_result})
         await q.put(final_data)
 
     except Exception as e:
@@ -96,7 +110,7 @@ async def start_processing(
 ):
     from pathlib import Path
 
-    if session_id:
+    if not DEBUGGING and session_id:
         # Validate if session actually exists on disk to prevent phantom sessions
         # (Optional security check)
         potential_path = Path(config.SESSION_FILEPATH) / session_id
@@ -107,8 +121,12 @@ async def start_processing(
             session_id = generate_id(prefix='sess')
     else:
         session_id = generate_id(prefix='sess')
-
-    run_id = generate_id(prefix='run')
+    
+    if DEBUGGING:
+        session_id = "sess_1c14d158"
+        run_id = "run_da02597c"
+    else:
+        run_id = generate_id(prefix='run')
     
     q = Queue()
     SESSION_QUEUES[session_id] = q
@@ -117,7 +135,7 @@ async def start_processing(
     file_names: List[str] = []
 
     # Save new files (if any)
-    if files:
+    if not DEBUGGING and files:
         try:
             for file in files:
                 if not file.filename: continue
@@ -193,3 +211,21 @@ async def stream_progress(request: Request, session_id: str):
             SESSION_QUEUES.pop(session_id, None)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+STORAGE_BASE_PATH = "session"
+@process_router.get("/storage/{session_id}/{run_id}/{filename}")
+async def get_diagram(session_id: str, run_id: str, filename: str):
+    # Construct the path safely
+    file_path = os.path.join(STORAGE_BASE_PATH, session_id, run_id, "figures", filename)
+    
+    # 1. Security Check: Prevent directory traversal (optional but recommended)
+    if not os.path.abspath(file_path).startswith(os.path.abspath(STORAGE_BASE_PATH)):
+        raise HTTPException(status_code=400, detail="Invalid path")
+
+    # 2. Check if file exists
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Diagram not found")
+
+    return FileResponse(
+        file_path
+    )

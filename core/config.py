@@ -17,7 +17,7 @@ class PathSettings(BaseSettings):
     FIGURE_FILEPATH: str = Field('figures', description="Generated images")
     MODEL_FILEPATH: str = Field('model', description="Saved models")
     
-    VISUAL_ALLOWED_EXTENSIONS: List[str] = ['*.png', '*.jpg', '*.jpeg', '*.svg', '*.pdf']
+    VISUAL_ALLOWED_EXTENSIONS: List[str] = ['*.png', '*.jpg', '*.jpeg', '*.pdf']
 
 class LogSettings(BaseSettings):
     """Logging configurations."""
