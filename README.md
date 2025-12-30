@@ -17,24 +17,25 @@
 
 ## Run
 
-### Launch docker
+<!-- ### Launch docker
 
 ```shell
 docker-compose -f docker/docker-compose.yml up
-```
+``` -->
 
-### Install dependency
+<!-- ### Install dependency
 
 ```shell
 poetry shell
 poetry install
-```
+``` -->
 
+<!--
 ### Apply alembic revision
 
 ```shell
 alembic upgrade head
-```
+``` -->
 
 ### Run server
 
@@ -42,7 +43,7 @@ alembic upgrade head
 poetry run python3 main.py --env local|dev|prod --debug
 ```
 
-### Run test codes
+<!-- ### Run test codes
 
 ```shell
 make test
@@ -260,4 +261,4 @@ from core.helpers.cache import Cache, CacheTag
 
 await Cache.remove_by_prefix(prefix="get_user_list")
 await Cache.remove_by_tag(tag=CacheTag.GET_USER_LIST)
-```
+``` -->
