@@ -24,7 +24,7 @@ TODO:
 
 - Context window management (Context Window)
 [] Planner Context
-[-] TaskNode Context
+[] TaskNode Context preservation over multiple turns (save last used code)
 
 - Handling multiple different datafiles, url
 [] Handle images
@@ -32,7 +32,7 @@ TODO:
 [] Handle Misc.
 
 - AA diagrams selection
-[] Decide which diagrams to present to user, accompanied with explanation
+[-] Decide which diagrams to present to user, accompanied with explanation
 
 - For presentation
 [] Showing the Graph update progress when waiting for results

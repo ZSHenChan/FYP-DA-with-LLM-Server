@@ -32,9 +32,11 @@ class SessionWorkspace:
             d.mkdir(parents=True, exist_ok=True)
 
     def get_log_path(self) -> Path:
+        """Return the path to the session-scoped log file."""
         return self.run_base / config.SESS_LOG_FILENAME
 
-    def save_json(self, filename: str, data: dict):
+    def save_json(self, data: dict, filename: str = config.FILENAME_AGENT_STATE):
+        """Persist a JSON-serializable dict under the current run directory."""
         sess_log = logging.getLogger(config.SESS_LOG_NAME)
 
         filepath = os.path.join(self.run_base, filename)
@@ -63,31 +65,25 @@ class SessionWorkspace:
         print(f"DEBUG: Total files found in dir: {[f.name for f in all_files]}")
     
         image_paths = []
-        # We look for extensions defined in your config (e.g., .png, .jpg)
         for ext in config.VISUAL_ALLOWED_EXTENSIONS:
             pattern = os.path.join(self.figure_dir, ext)
             image_paths.extend(glob.glob(pattern))
-            # # Using pathlib's glob is cleaner than os.glob
-            # # pattern e.g., "*.png"
-            # pattern = f"*{ext}" if ext.startswith(".") else f"*.{ext}"
-            # found = list(self.figure_dir.glob(pattern))
-            # image_paths.extend(found)
         
-        # Convert Path objects to strings for the State dict
         return [str(p) for p in image_paths]
     
     @property
     def graph_state_path(self) -> Path:
         """Path to the persistent JSON representation of the TaskGraph."""
-        # Saving directly in session_base allows Run 2 to easily find Run 1's graph
-        return self.session_base / "task_graph_state.json"
+        return self.session_base / config.FILENAME_TASK_GRAPH_STATE
 
     def save_graph_state(self, graph_dict: dict):
+        """Persist the serialized task graph state to disk."""
         import json
         with open(self.graph_state_path, 'w', encoding='utf-8') as f:
             json.dump(graph_dict, f, indent=2, ensure_ascii=False)
 
     def load_graph_state(self) -> dict | None:
+        """Load the persisted task graph state if it exists."""
         import json
         if not self.graph_state_path.exists():
             return None
@@ -97,8 +93,9 @@ class SessionWorkspace:
         except Exception:
             return None
         
-def load_prompt(agent_name, key: str='system_prompt') -> str:
-    file_path = f'prompts.json'
+def load_prompt(agent_name: str, key: str=config.PROMPT_KEY_UNIVERSAL_SYSTEM) -> str:
+    """Load a prompt string for the given agent and key from the prompt file."""
+    file_path = config.FILENAME_PROMPTS
     try:
         with open(file_path, 'r') as f:
             prompt_data = json.load(f)
@@ -115,6 +112,7 @@ def load_prompt(agent_name, key: str='system_prompt') -> str:
         raise
 
 def increase_num_steps(state: GlobalAgentState):
+    """Increment the tracked step counter in agent state if present."""
     try:
       state['num_steps'] += 1
     except Exception as e:
@@ -122,6 +120,7 @@ def increase_num_steps(state: GlobalAgentState):
 
 @dataclass
 class ExecuteResult:
+    """Structured result for code execution with success flag, message, and namespace."""
     success: bool
     message: str | None
     namespace: dict
@@ -129,9 +128,11 @@ class ExecuteResult:
 class CodeExecutor:
     """A class to execute code and capture printed output."""
     def __init__(self, namespace: dict):
+        """Create an executor with an isolated namespace for code execution."""
         self.namespace = namespace
 
     def execute(self, code: str) -> tuple[bool, str]:
+        """Run arbitrary code in the executor namespace and capture stdout/stderr."""
         old_stdout = sys.stdout
         old_stderr = sys.stderr  
         redirected_output = io.StringIO()
@@ -184,11 +185,13 @@ def write_response_txt(response: str, sess_id: str, run_id: str, filename: str =
     return str(filepath)
 
 def comment_block(text: str, prefix: str = "# ") -> str:
+    """Prefix each line of text with the given comment marker."""
     lines = text.splitlines()
     out_lines = [(prefix + line) if line.strip() else prefix.rstrip() for line in lines]
     return "\n".join(out_lines)
 
 def write_with_commented_instructions(path: str, instructions: str, marker: str = "# --- INSTRUCTIONS ---"):
+    """Append instructions to a file with comment markers and delimiters."""
     commented = comment_block(instructions)
     with open(path, "a", encoding="utf-8") as f:
         f.write("\n" + marker + "\n")

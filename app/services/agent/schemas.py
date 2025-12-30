@@ -63,8 +63,8 @@ class PydanticDiagramResult(BaseModel):
     text: str = Field(..., description="The explanation of the diagram.")
 
 class PydanticAnalysisResult(BaseModel):
-    summary: PydanticEditAction = Field(..., description="The type of change to apply.")
-    figures: List[PydanticDiagramResult] = Field(..., description="List of selected diagrams to help with explanation.")
+    summary: str = Field(..., description="The type of change to apply.")
+    figures: List[PydanticDiagramResult] = Field(..., description="List of handpicked diagrams that is crucial to help with explanation.")
 
 # --- TypedDicts ---
 

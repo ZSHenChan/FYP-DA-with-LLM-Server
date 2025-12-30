@@ -4,8 +4,7 @@ from graphlib import TopologicalSorter, CycleError
 from typing import Any, List, Dict, Union
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage, ToolMessage, FunctionMessage
 from core.config import config
 from .schemas import (
     GlobalAgentState, PydanticActionGraph, TaskStatus, 
@@ -20,42 +19,45 @@ logger = logging.getLogger(config.SESS_LOG_NAME)
 class ActionNode:
     """Represents a single executable code snippet within a task."""
     def __init__(self, action_id: int, code: str, description: str):
+        """Initialize an action with its identifier, runnable code, and description."""
         self.action_id = action_id
         self.description = description
         self.code = code
         self.status = TaskStatus.PENDING
-        self.result = None
 
     def to_dict(self) -> dict:
+        """Serialize the action node for persistence or logging."""
         return {
             "action_id": self.action_id,
             "code": self.code,
             "description": self.description,
             "status": self.status.value,
-            "result": self.result # Ensure result is serializable (str/dict), not an object
         }
     
     @classmethod
     def from_dict(cls, data: dict):
+        """Rebuild an ActionNode instance from serialized data."""
         node = cls(
             action_id=data["action_id"],
             code=data["code"],
             description=data["description"]
         )
         node.status = TaskStatus(data["status"])
-        node.result = data.get("result")
         return node
 
     def __repr__(self):
-        return f"ActionNode(id={self.action_id}, description='{self.description}', status='{self.status.value}', code='{self.code[:30]}...')"
+        """Return a concise debug string showing id, status, and code preview."""
+        return f"ActionNode(id={self.action_id}, description='{self.description}', status='{self.status.value}', code='{self.code[:config.LOG_PREVIEW_LENGTH]}...')"
 
 class ActionGraph:
     """Manages the sequence of actions for a single parent task."""
     def __init__(self):
+        """Manage an ordered collection of actions and their execution result."""
         self.nodes: List[ActionNode] = []
         self.result: ExecuteResult | None = None
 
     def to_dict(self) -> dict:
+        """Serialize the graph nodes and last execution summary."""
         return {
             "nodes": [node.to_dict() for node in self.nodes],
             "result_summary": self.result.message if self.result else None,
@@ -64,6 +66,7 @@ class ActionGraph:
 
     @classmethod
     def from_dict(cls, data: dict):
+        """Restore an ActionGraph from serialized node data."""
         graph = cls()
         for node_data in data.get("nodes", []):
             graph.add_action(ActionNode.from_dict(node_data))
@@ -73,6 +76,7 @@ class ActionGraph:
         return graph
 
     def add_action(self, node: ActionNode):
+        """Add an action node and keep nodes sorted by action_id."""
         self.nodes.append(node)
         self.nodes.sort(key=lambda n: n.action_id)
         
@@ -80,10 +84,11 @@ class ActionGraph:
         return f"ActionGraph with {len(self.nodes)} actions."
     
     def execute_action_graph(self, namespace: dict) -> ExecuteResult:
+        """Execute actions sequentially in the given namespace and record status."""
         executor = CodeExecutor(namespace=namespace)
         last_message = ''
         lean_namespace = {
-            'agent_state': executor.namespace.get('agent_state', 'Agent state not found')
+            config.KEY_AGENT_STATE: executor.namespace.get(config.KEY_AGENT_STATE, 'Agent state not found')
         }
         for current_action_node in self.nodes:
             exec_success, result = executor.execute(current_action_node.code)
@@ -98,6 +103,7 @@ class ActionGraph:
 
     #! Deprecated
     def print_actions(self):
+        """Deprecated: print action details for manual debugging."""
         for action in self.nodes:
             print(f"  - ID: {action.action_id}")
             print(f"    Description: {action.description}")
@@ -106,11 +112,13 @@ class ActionGraph:
 
 class TaskNode:
     """Represents a single node in the task graph."""
-    def __init__(self, node_id: str, instruction: str, dependencies: list[str], task_type: TaskType, output: str, model: str):
+    def __init__(self, node_id: str, node_name: str, instruction: str, dependencies: list[str], task_type: TaskType, output: str, model: str):
+        """Construct a task node with metadata, dependencies, and LLM client."""
         if not isinstance(node_id, str) or not node_id:
             raise ValueError("task_id must be a non-empty string.")
         
         self.node_id = node_id
+        self.node_name = node_name
         self.instruction = instruction
         self.dependencies = dependencies
         self.status = TaskStatus.PENDING
@@ -118,6 +126,7 @@ class TaskNode:
         self.output = output
         self.result: str | None = None
         self.action_graph = ActionGraph()
+        self.conversation_history = []
         self.llm = ChatOpenAI(
             model=model,
             openai_api_key=OPENAI_API_KEY,
@@ -128,11 +137,25 @@ class TaskNode:
         )
 
     def __repr__(self):
-        """Provides a string representation for the task node."""
+        """Return a readable summary with id, status, and dependency info."""
         return (f"TaskNode(id='{self.node_id}', status='{self.status.value}', "
                 f"instruction='{self.instruction[:30]}...', deps={self.dependencies})")
     
     def to_dict(self) -> dict:
+        """Serialize the task node, trimming conversation history and actions."""
+        history = getattr(self, "conversation_history", [])
+
+        latest_history = history[-config.HISTORY_CONTEXT_WINDOW:]
+
+        serialized_history = []
+        for msg in latest_history:
+            if hasattr(msg, "model_dump"): # LangChain Core / Pydantic v2
+                serialized_history.append(msg.model_dump())
+            elif hasattr(msg, "dict"): # Older Pydantic v1
+                serialized_history.append(msg.dict())
+            else:
+                serialized_history.append(msg)
+
         return {
             "node_id": self.node_id,
             "instruction": self.instruction,
@@ -142,22 +165,51 @@ class TaskNode:
             "status": self.status.value,
             "result": self.result,
             "action_graph": self.action_graph.to_dict(),
-            "model_name": self.llm.model_name # Persist which model created this
+            "model_name": self.llm.model_name,
+            "conversation_history": serialized_history
         }
     
     @classmethod
     def from_dict(cls, data: dict):
+        """Recreate a task node from stored data, including history and actions."""
         node = cls(
             node_id=data["node_id"],
             instruction=data["instruction"],
             dependencies=data["dependencies"],
             task_type=TaskType(data["task_type"]),
             output=data["output"],
-            model=data.get("model_name", config.OPENAI_MODEL) # Restore model or default
+            model=data.get("model_name", config.OPENAI_MODEL)
         )
         
         node.status = TaskStatus(data["status"])
         node.result = data.get("result")
+
+        if "conversation_history" in data and data["conversation_history"]:
+            raw_history = data["conversation_history"]
+            deserialized_history = []
+            
+            for msg_data in raw_history:
+                msg_type = msg_data.get("type")
+                
+                if "data" in msg_data and isinstance(msg_data["data"], dict):
+                    msg_payload = msg_data["data"]
+                else:
+                    msg_payload = msg_data
+
+                if msg_type == "human":
+                    deserialized_history.append(HumanMessage(**msg_payload))
+                elif msg_type == "ai":
+                    deserialized_history.append(AIMessage(**msg_payload))
+                elif msg_type == "system":
+                    deserialized_history.append(SystemMessage(**msg_payload))
+                elif msg_type == "tool":
+                    deserialized_history.append(ToolMessage(**msg_payload))
+                elif msg_type == "function":
+                    deserialized_history.append(FunctionMessage(**msg_payload))
+            
+            node.conversation_history = deserialized_history
+        else:
+            node.conversation_history = []
         
         if "action_graph" in data:
             node.action_graph = ActionGraph.from_dict(data["action_graph"])
@@ -165,9 +217,10 @@ class TaskNode:
         return node
 
     def plan_actions(self, global_agent_state: GlobalAgentState, workspace: SessionWorkspace, namespace: dict, tool_sets=[], additional_instruction: str = "", conversation_history: list = []) -> ActionGraph:
+        """Generate an action graph using the code agent prompt and current context."""
         structured_llm = self.llm.with_structured_output(PydanticActionGraph)
         
-        sys_prompt_template = load_prompt(agent_name='code')
+        sys_prompt_template = load_prompt(agent_name=config.AGENT_NAME_CODE)
         prompt = ChatPromptTemplate.from_messages([
             ("system", sys_prompt_template),
             ("human", "Agent State: {agent_state}. namespace: {namespace}"),
@@ -191,11 +244,8 @@ class TaskNode:
         return action_graph
 
     def replan_actions(self, global_agent_state: GlobalAgentState, workspace: SessionWorkspace, namespace: dict, conversation_history: list = []):
-        refinement_instruction = (
-          "The previous plan failed. Review the chat history, paying close attention "
-          "to the last 'Human' message (which contains the error) and the 'AI' message "
-          "(the plan that failed). Generate a new, corrected plan to achieve the goal."
-        )
+        """Regenerate the action graph with refinement instructions after failure."""
+        refinement_instruction = load_prompt(agent_name=config.AGENT_NAME_CODE, key=config.PROMPT_KEY_CODE_REPLAN)
         refined_graph: ActionGraph = self.plan_actions(global_agent_state=global_agent_state, workspace=workspace, namespace=namespace, additional_instruction=refinement_instruction, conversation_history=conversation_history)
         self.action_graph.nodes = refined_graph.nodes
         self.action_graph.result = None
@@ -204,7 +254,7 @@ class TaskNode:
           """Generate and refine the ActionGraph within a trial limit."""
           debug_agent_state: GlobalAgentState = deepcopy(global_agent_state)
           
-          namespace = {'agent_state': deepcopy(debug_agent_state)}
+          namespace = {config.KEY_AGENT_STATE: deepcopy(debug_agent_state)}
 
           self.conversation_history = []
 
@@ -212,7 +262,7 @@ class TaskNode:
           self.action_graph = action_graph
 
           for i in range(max_retries):
-              namespace = {'agent_state': deepcopy(debug_agent_state)}
+              namespace = {config.KEY_AGENT_STATE: deepcopy(debug_agent_state)}
               
               logger.debug(f"Trial {i+1}")
               self.action_graph.execute_action_graph(namespace)
@@ -226,7 +276,7 @@ class TaskNode:
                   plan_data.append({
                       "action_id": node.action_id,
                       "description": node.description,
-                      "code": node.code  # This includes the full, untruncated code
+                      "code": node.code
                   })
               plan_string = json.dumps(plan_data, indent=2)
               self.conversation_history.append(AIMessage(content=f"Current plan:\n```json\n{plan_string}\n```"))
@@ -244,25 +294,20 @@ class TaskNode:
               else:
                   self.status = TaskStatus.SUCCESS
                   break
-          self._save_conversation_history(sess_id=global_agent_state["sess_id"], run_id=global_agent_state["run_id"])
+              
+          self._save_conversation_history(workspace=workspace)
           logger.debug(f"History Traceback: {self.conversation_history}")
           if self.action_graph.result is not None and self.action_graph.result.success is False:
               self.status = TaskStatus.FAILED
               self.result = str(self.action_graph.result)
 
-    def _save_conversation_history(self, sess_id: str, run_id: str, filename: str = "conversation_history.txt", ensure_dir: bool = True) -> str:
+    def _save_conversation_history(self, workspace: SessionWorkspace, filename: str = config.FILENAME_CONVERSATION_HISTORY, ensure_dir: bool = True) -> str:
         """
         Persist a conversation history to session/{sess_id}/{run_id}/{filename}.
         - conversation_history: list of messages (dicts with 'sender'/'content' or langchain Message objects with .content)
         - returns the written filepath as string
         """
-        import os
         import json
-        from pathlib import Path
-
-        dest_dir = Path(f"session/{sess_id}/{run_id}")
-        if ensure_dir:
-            dest_dir.mkdir(parents=True, exist_ok=True)
 
         def _format_message(msg) -> str:
             # dict-like AgentMessage
@@ -285,7 +330,7 @@ class TaskNode:
 
             return f"{sender}:\n{content_str}\n"
 
-        filepath = dest_dir / filename
+        filepath = workspace.run_base / filename
         with open(filepath, "w", encoding="utf-8") as f:
             for i, msg in enumerate(self.conversation_history, start=1):
                 f.write(f"--- Message {i} ---\n")
@@ -296,30 +341,50 @@ class TaskNode:
         return str(filepath)
     
     def run_action_graph(self, agent_state: GlobalAgentState) -> GlobalAgentState:
-        namespace = {'agent_state':{}}
-        agent_state_copy = deepcopy(agent_state)
+        """
+        Final run of ActionGraph
+        - Raise Error if run result failed
+        """
+        namespace = {config.KEY_AGENT_STATE:{}}
+
+        final_state = deepcopy(agent_state)
 
         self.action_graph.execute_action_graph(namespace)
 
         if self.action_graph.result is not None and self.action_graph.result.success:
-            modified_inner_state = self.action_graph.result.namespace.get('agent_state', {})
+            modified_inner_state = self.action_graph.result.namespace.get(config.KEY_AGENT_STATE, {})
             
             execution_log = {
                 'sender': f"{self.task_type.value} agent", 
                 'message': modified_inner_state
             }
-            agent_state_copy['agent_messages'].append(execution_log)
-            return agent_state_copy
+
+            final_state[config.KEY_AGENT_MESSAGES].append(execution_log)
+            if isinstance(modified_inner_state, dict):
+                
+                ALLOWED_SCHEMA_KEYS = config.ALLOWED_STATE_SCHEMA_KEYS
+
+                for key, value in modified_inner_state.items():
+                    if key in ALLOWED_SCHEMA_KEYS:
+                        final_state[key] = value
+                    
+                    elif key in final_state and key != config.KEY_AGENT_MESSAGES:
+                        final_state[key] = value
+                    
+            return final_state
+        
         else:
-            raise RuntimeError(f'Failed to run ActionGraph {self.node_id}: {self.action_graph.result}')
+            error_msg = self.action_graph.result.message if self.action_graph.result else "Unknown error"
+            raise RuntimeError(f'Failed to run ActionGraph {self.node_id}: {error_msg}')
 
 class TaskGraph:
     """Manages the entire Directed Acyclic Graph (DAG) of tasks."""
     def __init__(self, model:str, max_retries: int = config.TASK_GRAPH_MAX_RETRIES):
+        """Initialize the task graph with LLM client, system prompts, and retry limits."""
         self.max_retries: int = max_retries
         self.nodes: dict[str, TaskNode] = {}
-        self.sys_instructions: str = load_prompt(agent_name='master')
-        self.sys_instructions_refine: str = load_prompt(agent_name='master', key='system_prompt_refine')
+        self.sys_instructions: str = load_prompt(agent_name=config.AGENT_NAME_MASTER)
+        self.sys_instructions_refine: str = load_prompt(agent_name=config.AGENT_NAME_MASTER, key=config.PROMPT_KEY_MASTER_REFINE)
         self.llm: ChatOpenAI = ChatOpenAI(
             model=model,
             openai_api_key=OPENAI_API_KEY,
@@ -330,6 +395,7 @@ class TaskGraph:
           )
         
     def to_dict(self) -> dict:
+        """Serialize all task nodes keyed by their identifiers."""
         return {
             "nodes": {
                 tid: node.to_dict() for tid, node in self.nodes.items()
@@ -338,6 +404,7 @@ class TaskGraph:
 
     @classmethod
     def from_dict(cls, data: dict, model: str = config.OPENAI_MODEL):
+        """Rehydrate a TaskGraph from serialized data using the specified model."""
         graph = cls(model=model)
         for tid, node_data in data.get("nodes", {}).items():
             node = TaskNode.from_dict(node_data)
@@ -345,11 +412,7 @@ class TaskGraph:
         return graph
 
     def add_task(self, task: TaskNode, replace: bool = False):
-        """Adds a TaskNode to the graph.
-        If a task with the same id exists:
-          - if replace is True, overwrite the existing TaskNode,
-          - otherwise raise ValueError.
-        """
+        """Insert a task node, optionally replacing an existing one with the same id."""
         if not isinstance(task.node_id, str) or not task.node_id:
             raise ValueError("task_id must be a non-empty string.")
         if task.node_id in self.nodes:
@@ -379,6 +442,7 @@ class TaskGraph:
                 # Decide: Continue or Raise? Usually better to continue best-effort.
 
     def _handle_add(self, p_node):
+        """Add a planned task node, warning if dependencies are missing."""
         if not p_node: 
             return
         # Create new node
@@ -399,18 +463,13 @@ class TaskGraph:
         logger.info(f"Added Task {new_node.node_id}")
 
     def _handle_modify(self, p_node):
+        """Update an existing task node’s instruction, dependencies, and output."""
         if not p_node or p_node.task_id not in self.nodes:
             logger.warning(f"Cannot modify unknown task {getattr(p_node, 'task_id', 'Unknown')}")
             return
         
         existing_node = self.nodes[p_node.task_id]
         
-        # SAFETY CHECK: Don't modify completed work unless you implement a reset mechanism
-        # if existing_node.status == TaskStatus.SUCCESS:
-        #     logger.warning(f"Refusing to modify completed task {existing_node.node_id}. Please use a new task instead.")
-        #     return
-
-        # Update fields
         existing_node.instruction = p_node.instruction
         existing_node.dependencies = p_node.dependencies
         existing_node.output = p_node.output
@@ -418,18 +477,16 @@ class TaskGraph:
         logger.info(f"Modified Task {existing_node.node_id}")
     
     def _handle_delete(self, node_id: str):
+        """Delete a task node and warn about any dependent tasks."""
         if node_id not in self.nodes:
             return
         
-        # SAFETY CHECK: Orphan Prevention
-        # If any other node depends on this one, we cannot delete it safely.
         dependents = [
             tid for tid, node in self.nodes.items() 
             if node_id in node.dependencies
         ]
         if dependents:
             logger.warning(f"Deleting task {node_id}; tasks {dependents} depend on it.")
-            # return
 
         del self.nodes[node_id]
         logger.info(f"Deleted Task {node_id}")
@@ -479,12 +536,11 @@ class TaskGraph:
             )
             self.add_task(node)
 
-    def refine_plan(self, add_input:str, file_list: List[Dict[str, Any]]):
+    def refine_plan(self, file_context: List[Dict[str, Any]], history: List[BaseMessage] = []):
         """
         Takes an existing populated graph and asks the LLM to add/modify nodes
         based on new user input.
         """
-        # 1. Serialize current state for the LLM context
         current_graph_summary = []
         for tid, node in self.nodes.items():
             current_graph_summary.append(
@@ -492,38 +548,28 @@ class TaskGraph:
             )
         current_graph_str = "\n".join(current_graph_summary)
 
-        # 2. Construct Prompt
-        # We need a specific prompt that tells the LLM: "Don't reinvent the wheel.
-        # Only add new tasks for the new requirement. Mark dependencies on old tasks."
-        
         system_msg = (
             f"{self.sys_instructions}\n"
             f"{self.sys_instructions_refine}\n"
             f"EXISTING WORKFLOW STATE:\n{current_graph_str}\n\n"
         )
 
-        # 3. Call LLM (Same logic as generate_plan)
-        structured_llm = self.llm.with_structured_output(PydanticGraphModificationPlan)
-        messages = [
-            SystemMessage(content=system_msg),
-            HumanMessage(content=file_list),
-            HumanMessage(content=f"Follow-up Request: {add_input}")
-        ]
-        
-        pydantic_response: PydanticGraphModificationPlan = structured_llm.invoke(messages)
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_msg),
+            ("system", "Current available files:\n{file_context}"),
+            MessagesPlaceholder(variable_name="chat_history"),
+        ])
 
-        # 4. Merge Logic
-        # We assume the LLM returns the changes made only.
+        structured_llm = self.llm.with_structured_output(PydanticGraphModificationPlan)
+        chain = prompt | structured_llm
+
+        import json
+        pydantic_response: PydanticGraphModificationPlan = chain.invoke({
+            "file_context": json.dumps(file_context, indent=2), 
+            "chat_history": history,
+        })
         
         self.apply_edits(pydantic_response)
-
-    # def initialize_task_graph(self, human_input:str, global_agent_state: GlobalAgentState, file_list: List[str], progress_callback: Union[callable, None] = None):
-    #     self._generate_task_graph(human_input=human_input, sess_id=global_agent_state['sess_id'], file_list=file_list)
-    #     increase_num_steps(global_agent_state)
-    #     logger.info(f'== Task Graph created with {len(self.nodes)} Nodes.')
-    #     if progress_callback:
-    #         progress_callback(f'Task Graph created with {len(self.nodes)} Nodes.')
-    #     self._save_taskgraph_structure(sess_id = global_agent_state["sess_id"], run_id=global_agent_state["run_id"])
 
     def _get_execution_order(self) -> list[str]:
         """
@@ -545,7 +591,7 @@ class TaskGraph:
         self,
         sess_id: str | None = None,
         run_id: str | None = None,
-        filename: str = "taskgraph_structure.txt",
+        filename: str = config.FILENAME_TASK_GRAPH,
         include_actions: bool = True,
         ensure_dir: bool = True
     ) -> str:
@@ -596,7 +642,23 @@ class TaskGraph:
             logger.error(f"Failed to save taskgraph structure to {filepath}: {e}", exc_info=True)
             raise
     
-    def print_graph(self, sess_id:str, run_id: str, verbose: bool = True, ensure_dir=True, filename: str = 'code.py'):
+    def _log_and_notify(self, message: str, progress_callback: Union[callable, None] = None, level: str = "info"):
+        """
+        Logs a message and optionally sends it to the progress callback.
+        """
+        # Handle Logging
+        if level.lower() == "error":
+            logger.error(message)
+        elif level.lower() == "warning":
+            logger.warning(message)
+        else:
+            logger.info(message)
+
+        # Handle Progress Streaming to frontend
+        if progress_callback:
+            progress_callback(message)
+
+    def save_code(self, sess_id:str, run_id: str, verbose: bool = True, ensure_dir=True, filename: str = config.FILENAME_CODE_SUMMARY):
         """Prints a summary of all tasks and their dependencies."""
         from pathlib import Path
         
@@ -617,7 +679,6 @@ class TaskGraph:
                         f.write(f"# --- Task {task_id} ---\n")
                         f.write(f"# Instruction:\n")
                         f.write(comment_block(node.instruction))
-                        # if node has an action_graph, write each action's code
                         if getattr(node, 'action_graph', None) and node.action_graph.nodes:
                             for action in node.action_graph.nodes:
                                 f.write(f"# Action {action.action_id}:\n")
@@ -644,6 +705,7 @@ class TaskGraph:
           - evaluate optional `condition` (simple eval with limited globals),
           - execute via TaskNode.iterate_refining(llm, agent_state),
           - update agent_state from action_graph result if present.
+          - Raise RuntimeError if final run fails & stop_on_failure=True
         Returns final agent_state dict.
         """
         # ensure order
@@ -659,33 +721,34 @@ class TaskGraph:
                 continue
 
             node = self.nodes[tid]
+
+            # Skip Success Nodes
             if node.status == TaskStatus.SUCCESS:
-                logger.info(f"Skipping already completed task {tid}")
-                # IMPORTANT: You must still apply the result of this node 
-                # to the current_state so downstream nodes have context!
-                if node.result: 
-                    # Replay the side-effect on state if needed, 
-                    # or ensure state carries over from previous run.
+                logger.debug(f"Skipping already completed task {tid}")
+                if node.result:
                     pass 
                 continue
-            logger.info(f"== Initializing task {tid}")
-            if progress_callback:
-                progress_callback(f'Initializing task {tid}')
-
+            
+            # Try to run node, Refine if FAILED
+            self._log_and_notify(f'Working on Task {tid}', progress_callback=progress_callback)
             node.execute_with_retry(global_agent_state=current_state, workspace=workspace, max_retries=config.TASK_NODE_MAX_RETRIES)
             if node.status is TaskStatus.FAILED:
-                logger.info(f'{node.node_id} failed to run in {self.max_retries} trials. Refining TaskGraph...')
-                if progress_callback:
-                    progress_callback(f'{node.node_id} failed to run in {self.max_retries} trials. Refining TaskGraph...')
+                self._log_and_notify(f'{node.node_id} failed to run in {self.max_retries} trials. Refining TaskGraph...', progress_callback=progress_callback)
                 self.refine_plan(f'Node with id {node.node_id} failed to run within {config.TASK_NODE_MAX_RETRIES} tries. Make changes to the Node and try again.')
-
+                return self.execute_pipeline(
+                    initial_state=current_state, # Pass the state we have accumulated so far
+                    workspace=workspace, 
+                    stop_on_failure=stop_on_failure, 
+                    progress_callback=progress_callback
+                )
+            # Final run that will change agent state
             try:
                 current_state = node.run_action_graph(agent_state=current_state)
-            except Exception as e:
+            except RuntimeError as e:
                 logger.error(f"Exception when running task {tid}: {type(e).__name__}: {e}", exc_info=True)
                 node.status = TaskStatus.FAILED
                 if stop_on_failure:
-                    break
+                    raise
                 else:
                     continue
                     

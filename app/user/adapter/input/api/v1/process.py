@@ -16,7 +16,7 @@ SESSION_QUEUES: Dict[str, Queue] = {}
 
 logger = logging.getLogger(__name__)
 
-DEBUGGING = True
+DEBUGGING = False
 
 def generate_id(prefix: str | None = None) -> str:
     import uuid

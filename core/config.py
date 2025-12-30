@@ -23,9 +23,20 @@ class LogSettings(BaseSettings):
     """Logging configurations."""
     SESS_LOG_NAME: str = 'sess_log'
     SESS_LOG_FILENAME: str = 'sess.log'
+    SESS_LOG_FORMAT: str = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     CENTRAL_LOG_DIR: str = 'logs'
     CENTRAL_LOG_FILENAME: str = 'central.log'
     CENTRAL_LOG_NAME: str = 'api_gateway'
+
+    # Per Run
+    STATUS_SUCCESS: str = 'SUCCESS'
+    STATUS_FAILED: str = 'FAILED'
+
+    # Standard error message to show users when internal logic crashes
+    ERROR_MSG_EXECUTION_FAILED: str = "An error occurred during execution."
+
+     # Sentry / Monitoring
+    SENTRY_SDN: Optional[str] = None
 
 class ServerSettings(BaseSettings):
     """FastAPI Server and Security settings."""
@@ -65,6 +76,15 @@ class DatabaseSettings(BaseSettings):
     CELERY_BROKER_URL: str = "amqp://user:bitnami@localhost:5672/"
     CELERY_BACKEND_URL: str = "redis://:password123@localhost:6379/0"
 
+class FileSystemConfig(BaseSettings):
+    FILENAME_CONVERSATION_HISTORY: str = "conversation_history.txt"
+    FILENAME_TASK_GRAPH: str = "taskgraph_structure.txt"
+    FILENAME_CODE_SUMMARY: str = "code.py"
+    FILENAME_SESSION_HISTORY: str = "session_history.json"
+    FILENAME_AGENT_STATE: str = "agent_state.json"
+    FILENAME_TASK_GRAPH_STATE: str = "task_graph_state.json"
+    FILENAME_PROMPTS: str = "prompts.json"
+    
 class LlmConfig(BaseSettings):
     LLM_MAX_RETRIES: int = 2
     OPENAI_MODEL: str = 'gpt-5-mini-2025-08-07'
@@ -78,9 +98,39 @@ class AgentSettings(BaseSettings):
     """Workflow and Agent logic configuration."""
     TASK_NODE_MAX_RETRIES: int = 5
     TASK_GRAPH_MAX_RETRIES: int = 3
-    
-    # Sentry / Monitoring
-    SENTRY_SDN: Optional[str] = None
+
+    # Names used to load specific prompts via load_prompt(), refer to prompts.json
+    AGENT_NAME_CODE: str = "code"
+    AGENT_NAME_MASTER: str = "master"
+
+    # Prompt loading keys
+    PROMPT_KEY_UNIVERSAL_SYSTEM: str = "system_prompt"
+    PROMPT_KEY_MASTER_ANS: str = "system_prompt_ans"
+    PROMPT_KEY_MASTER_REQ: str = "system_prompt_user_req"
+    PROMPT_KEY_MASTER_REFINE: str = "system_prompt_refine"
+
+    PROMPT_KEY_ANALYSIS_REQ: str = "prompt_analysis_req"
+
+    PROMPT_KEY_CODE_REPLAN: str = "system_prompt_replan"
+
+    # Keys used in the execution namespace
+    KEY_AGENT_STATE: str = "agent_state"
+    KEY_AGENT_MESSAGES: str = "agent_messages"
+
+    # Whitelisted keys that an action is allowed to update in the global state
+    ALLOWED_STATE_SCHEMA_KEYS: set = {
+        "visualization_paths", 
+        "evaluation_results", 
+        "processed_path",
+        "data_path"
+    }
+
+class LogicSettings(BaseSettings):
+   
+    # How many recent messages to keep when serializing history (TaskNode.to_dict)
+    HISTORY_CONTEXT_WINDOW: int = 2 
+    # Length of string to display in __repr__ methods
+    LOG_PREVIEW_LENGTH: int = 30
 
 class BaseConfig(
     ServerSettings, 
@@ -88,7 +138,9 @@ class BaseConfig(
     PathSettings, 
     LogSettings, 
     AgentSettings, 
-    LlmConfig, 
+    LlmConfig,
+    FileSystemConfig,
+    LogicSettings,
     BaseSettings
 ):
     """
@@ -117,12 +169,11 @@ class ProductionConfig(BaseConfig):
 
 def get_config() -> BaseConfig:
     env = os.getenv("ENV", "local")
-    config_type = {
-        "test": TestConfig(),
-        "local": LocalConfig(),
-        "prod": ProductionConfig(),
-    }
-    return config_type[env]
+    if env == "test":
+        return TestConfig()
+    elif env == "prod":
+        return ProductionConfig()
+    return LocalConfig()
 
 
 config = get_config()
